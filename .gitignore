@@ -11,3 +11,9 @@ manglaria_abril_timeseries.csv
 # Máscaras temporales
 resultados_manglaria/mask_*.npy
 resultados_patrones/config_*.yaml
+
+logs/
+__pycache__/
+*.pyc
+resultados_manglaria/config_*.yaml
+resultados_patrones/config_*.yaml

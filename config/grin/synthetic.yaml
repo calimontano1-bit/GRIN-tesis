@@ -5,8 +5,8 @@ min_seq: 4
 max_seq: 9
 use_exogenous: False
 
-epochs: 200
-batch_size: 32
+epochs: 4
+batch_size: 64
 
 model_name: 'grin'
 d_hidden: 16

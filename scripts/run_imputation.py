@@ -4,6 +4,7 @@ import os
 import pathlib
 from argparse import ArgumentParser
 
+import pandas as pd
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -60,6 +61,182 @@ def get_dataset(dataset_name):
         dataset = datasets.MissingValuesMetrLA(p_fault=0., p_noise=0.25)
     elif dataset_name == 'bay_point':
         dataset = datasets.MissingValuesPemsBay(p_fault=0., p_noise=0.25)
+    elif dataset_name == 'manglaria':
+    # ── CARGA Y PREPARACIÓN ───────────────────────────────────────────────────
+        DATA_PATH     = 'manglaria_abril_timeseries.csv'
+        TIMESTAMP_COL = 'TIMESTAMP'
+        TIMESTAMP_FMT = '%d/%m/%Y %H:%M'
+    
+        df_raw = pd.read_csv(DATA_PATH)
+        df_raw[TIMESTAMP_COL] = pd.to_datetime(
+            df_raw[TIMESTAMP_COL], format=TIMESTAMP_FMT
+        )
+        df_raw = df_raw.sort_values(TIMESTAMP_COL).reset_index(drop=True)
+        df_raw = df_raw.set_index(TIMESTAMP_COL)
+    
+        # Solo columnas numéricas — excluye TIMESTAMP automáticamente
+        df_num = df_raw.select_dtypes(include=[np.number])
+    
+        # ── CLASE ADAPTADOR ───────────────────────────────────────────────────────
+        class ManglarIAAdapter:
+            def __init__(self, df):
+                import numpy as np
+                import pandas as pd
+
+                T, N = df.shape
+
+                # ── MÁSCARA ───────────────────────────────────────────────────
+                mask_np         = (~df.isnull()).values.astype(np.uint8)
+                self._mask_full = mask_np.reshape(T, N, 1)
+
+                # ── FILL + NORMALIZACIÓN ──────────────────────────────────────
+                df_filled    = df.ffill().bfill().fillna(0.0)
+                n_train      = int(T * 0.7)
+                self._mean   = df_filled.iloc[:n_train].mean()
+                self._std    = df_filled.iloc[:n_train].std().replace(0, 1.0)
+                df_norm      = (df_filled - self._mean) / self._std
+                self._data   = df_norm.values.reshape(T, N, 1)
+
+               # ── EVAL MASK ─────────────────────────────────────────────────────
+                mask_path = os.environ.get('GRIN_MASK_PATH', '')
+                if mask_path and os.path.exists(mask_path):
+                    artificial = np.load(mask_path).astype(np.uint8)  # (T, N)
+                    eval_mask_np = artificial
+                else:
+                    eval_mask_np = (df.isnull()).values.astype(np.uint8)
+                self._eval_mask = eval_mask_np.reshape(T, N, 1)
+                
+                # ── ÍNDICE ────────────────────────────────────────────────────
+                self._index = np.arange(T)
+
+                # ── ADYACENCIA ────────────────────────────────────────────────
+                adj = np.ones((N, N), dtype=float)
+                np.fill_diagonal(adj, 0.0)
+                self._adj = adj
+
+                # ── DATAFRAME ─────────────────────────────────────────────────
+                self.df = df_norm
+                self._N = N
+                self._T = T
+    
+            def numpy(self, return_idx=False):
+                if return_idx:
+                    return self._data, self._index
+                return self._data
+    
+            @property
+            def training_mask(self):
+                # Datos visibles durante entrenamiento:
+                # presentes en el CSV menos los reservados para evaluación
+                # Con tan pocos huecos reales (0.2%) training_mask ≈ mask_full
+                return self._mask_full & (1 - self._eval_mask)
+    
+            @property
+            def eval_mask(self):
+                # Huecos reales del CSV — el modelo los intentará imputar
+                return self._eval_mask
+    
+            def splitter(self, dataset, val_len=0.1, test_len=0.2):
+                import numpy as np
+                n       = len(dataset)
+                n_test  = int(n * test_len)
+                n_val   = int(n * val_len)
+                n_train = n - n_test - n_val
+                # División cronológica: train primero, test al final
+                # Importante para series temporales — no mezclar futuro con pasado
+                return [
+                    np.arange(0, n_train),
+                    np.arange(n_train, n_train + n_val),
+                    np.arange(n_train + n_val, n)
+                ]
+    
+            def get_similarity(self, thr=0., sparse=False, **kwargs):
+                import numpy as np
+                adj = self._adj.copy()
+                adj[adj < thr] = 0.
+                return adj
+    
+        return ManglarIAAdapter(df_num)
+    elif dataset_name == 'synthetic':
+        from lib.datasets.synthetic import ChargedParticles
+        
+        # Cargamos el dataset original sin tocarlo
+        raw = ChargedParticles(
+            static_adj=False,
+            p_block=float(os.environ.get('GRIN_P_BLOCK', '0.025')),
+            p_point=float(os.environ.get('GRIN_P_POINT', '0.025')),
+            min_seq=int(os.environ.get('GRIN_MIN_SEQ', '4')),
+            max_seq=int(os.environ.get('GRIN_MAX_SEQ', '9')),
+            use_exogenous=False
+        )
+        
+        class SyntheticAdapter:
+            def __init__(self, raw):
+                import numpy as np
+                import pandas as pd
+                
+                # ── DATOS ──────────────────────────────────────────
+                # raw.loc: (5000, 50, 10, 2)
+                # n_sims=5000 simulaciones, T=50 pasos, N=10 nodos, d=2 dims
+                loc      = raw.loc.numpy()
+                mask     = raw.mask.numpy()
+                eval_m   = raw.eval_mask.numpy()  # original, sin modificar
+                n_sims, T, N, d = loc.shape
+                
+                # Concatenamos simulaciones y aplanamos nodos+dims
+                # (5000*50, 10*2) = (250000, 20)
+                self._data      = loc.reshape(n_sims * T, N, d)
+                self._mask      = mask.reshape(n_sims * T, N, d)
+                self._eval_mask = eval_m.reshape(n_sims * T, N, d)
+                self._index     = np.arange(n_sims * T)
+                
+                # ── ADYACENCIA ─────────────────────────────────────
+                # ChargedParticles.get_similarity devuelve matriz totalmente
+                # conectada (10,10) sin self-loops — perfecta para empezar
+                self._adj = raw.get_similarity()
+
+                # Creamos un DataFrame simple con los datos aplanados
+                # para que el script pueda hacer sus análisis post-entrenamiento
+                self.df = pd.DataFrame(
+                    self._data.reshape(len(self._data), -1)
+                )
+            
+            def numpy(self, return_idx=False):
+                # Lo que run_imputation usa para construir ImputationDataset
+                if return_idx:
+                    return self._data, self._index
+                return self._data
+            
+            @property
+            def training_mask(self):
+                # Datos visibles durante entrenamiento:
+                # mask=1 donde hay valor, MENOS los huecos de evaluación
+                return self._mask & (1 - self._eval_mask)
+            
+            @property
+            def eval_mask(self):
+                # Huecos artificiales para medir qué tan bien imputa GRIN
+                return self._eval_mask
+            
+            def splitter(self, dataset, val_len=0.1, test_len=0.2):
+                import numpy as np
+                n       = len(dataset)
+                n_test  = int(n * test_len)
+                n_val   = int(n * val_len)
+                n_train = n - n_test - n_val
+                return [
+                    np.arange(0, n_train),
+                    np.arange(n_train, n_train + n_val),
+                    np.arange(n_train + n_val, n)
+                ]
+            
+            def get_similarity(self, thr=0., sparse=False, **kwargs):
+                import numpy as np
+                adj = self._adj.copy().astype(float)
+                adj[adj < thr] = 0.
+                return adj
+    
+        return SyntheticAdapter(raw)
     else:
         raise ValueError(f"Dataset {dataset_name} not available in this setting.")
     return dataset
@@ -246,29 +423,32 @@ def run_experiment(args):
 
     with torch.no_grad():
         y_true, y_hat, mask = filler.predict_loader(dm.test_dataloader(), return_mask=True)
-    y_hat = y_hat.detach().cpu().numpy().reshape(y_hat.shape[:3])  # reshape to (eventually) squeeze node channels
+    y_hat = y_hat.detach().cpu().numpy().reshape(y_hat.shape[0], y_hat.shape[1], -1) # reshape to (eventually) squeeze node channels
 
     # Test imputations in whole series
-    eval_mask = dataset.eval_mask[dm.test_slice]
-    df_true = dataset.df.iloc[dm.test_slice]
-    metrics = {
-        'mae': numpy_metrics.masked_mae,
-        'mse': numpy_metrics.masked_mse,
-        'mre': numpy_metrics.masked_mre,
-        'mape': numpy_metrics.masked_mape
-    }
-    # Aggregate predictions in dataframes
-    index = dm.torch_dataset.data_timestamps(dm.testset.indices, flatten=False)['horizon']
-    aggr_methods = ensure_list(args.aggregate_by)
-    df_hats = prediction_dataframe(y_hat, index, dataset.df.columns, aggregate_by=aggr_methods)
-    df_hats = dict(zip(aggr_methods, df_hats))
-    for aggr_by, df_hat in df_hats.items():
-        # Compute error
-        print(f'- AGGREGATE BY {aggr_by.upper()}')
-        for metric_name, metric_fn in metrics.items():
-            error = metric_fn(df_hat.values, df_true.values, eval_mask).item()
-            print(f' {metric_name}: {error:.4f}')
-
+    try:
+        eval_mask = dataset.eval_mask[dm.test_slice]
+        df_true = dataset.df.iloc[dm.test_slice]
+        metrics = {
+            'mae': numpy_metrics.masked_mae,
+            'mse': numpy_metrics.masked_mse,
+            'mre': numpy_metrics.masked_mre,
+            'mape': numpy_metrics.masked_mape
+        }
+        # Aggregate predictions in dataframes
+        index = dm.torch_dataset.data_timestamps(dm.testset.indices, flatten=False)['horizon']
+        aggr_methods = ensure_list(args.aggregate_by)
+        df_hats = prediction_dataframe(y_hat, index, dataset.df.columns, aggregate_by=aggr_methods)
+        df_hats = dict(zip(aggr_methods, df_hats))
+        for aggr_by, df_hat in df_hats.items():
+            # Compute error
+            print(f'- AGGREGATE BY {aggr_by.upper()}')
+            for metric_name, metric_fn in metrics.items():
+                error = metric_fn(df_hat.values, df_true.values, eval_mask).item()
+                print(f' {metric_name}: {error:.4f}')
+    except Exception as e:
+        print(f'[Skipping post-hoc analysis for synthetic data: {e}]')
+        
     return y_true, y_hat, mask
 
 

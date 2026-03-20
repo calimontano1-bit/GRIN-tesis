@@ -1,0 +1,41 @@
+# config/grin/manglaria.yaml
+# Configuración GRIN para datos ManglarIA
+# Un sensor, 27 variables como nodos, frecuencia 30 min
+
+# Datos
+window: 48          # ventana de 48 pasos = 24 horas (frecuencia 30min)
+stride: 1
+
+# Entrenamiento
+epochs: 12
+batch_size: 32
+lr: 0.001
+patience: 10        # early stopping si val_mae no mejora en 10 epochs
+
+# Optimizador
+l2_reg: 0.0
+grad_clip_val: 5.0
+grad_clip_algorithm: norm
+
+# Modelo GRIN
+model_name: grin
+d_hidden: 32        # más capacidad que sintético porque d=1 pero N=27
+d_emb: 0
+d_ff: 32
+ff_dropout: 0.0
+kernel_size: 2
+decoder_order: 1
+n_layers: 1
+layer_norm: false
+merge: mlp
+
+# Grafo
+adj_threshold: 0.0  # totalmente conectada, sin umbral
+
+# Split
+val_len: 0.1
+test_len: 0.2
+
+# Misc
+in_sample: false
+aggregate_by: mean

@@ -1,7 +1,7 @@
 import torch
 
 from . import Filler
-from ..nn.models import MPGRUNet, GRINet, BiMPGRUNet
+from ..nn.models import GRINet
 
 
 class GraphFiller(Filler):
@@ -31,10 +31,7 @@ class GraphFiller(Filler):
                                           scheduler_kwargs=scheduler_kwargs)
 
         self.tradeoff = pred_loss_weight
-        if model_class is MPGRUNet:
-            self.trimming = (warm_up, 0)
-        elif model_class in [GRINet, BiMPGRUNet]:
-            self.trimming = (warm_up, warm_up)
+        self.trimming = (0, 0)
 
     def trim_seq(self, *seq):
         seq = [s[:, self.trimming[0]:s.size(1) - self.trimming[1]] for s in seq]

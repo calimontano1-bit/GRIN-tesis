@@ -25,43 +25,19 @@ from lib.utils.parser_utils import str_to_bool
 
 
 def has_graph_support(model_cls):
-    return model_cls in [models.GRINet, models.MPGRUNet, models.BiMPGRUNet]
+    return model_cls in [models.GRINet]
 
 
 def get_model_classes(model_str):
-    if model_str == 'brits':
-        model, filler = models.BRITSNet, fillers.BRITSFiller
-    elif model_str == 'grin':
+    if model_str == 'grin':
         model, filler = models.GRINet, fillers.GraphFiller
-    elif model_str == 'mpgru':
-        model, filler = models.MPGRUNet, fillers.GraphFiller
-    elif model_str == 'bimpgru':
-        model, filler = models.BiMPGRUNet, fillers.GraphFiller
-    elif model_str == 'var':
-        model, filler = models.VARImputer, fillers.Filler
-    elif model_str == 'gain':
-        model, filler = models.RGAINNet, fillers.RGAINFiller
-    elif model_str == 'birnn':
-        model, filler = models.BiRNNImputer, fillers.MultiImputationFiller
-    elif model_str == 'rnn':
-        model, filler = models.RNNImputer, fillers.Filler
     else:
         raise ValueError(f'Model {model_str} not available.')
     return model, filler
 
 
 def get_dataset(dataset_name):
-    if dataset_name[:3] == 'air':
-        dataset = datasets.AirQuality(impute_nans=True, small=dataset_name[3:] == '36')
-    elif dataset_name == 'bay_block':
-        dataset = datasets.MissingValuesPemsBay()
-    elif dataset_name == 'la_block':
-        dataset = datasets.MissingValuesMetrLA()
-    elif dataset_name == 'la_point':
-        dataset = datasets.MissingValuesMetrLA(p_fault=0., p_noise=0.25)
-    elif dataset_name == 'bay_point':
-        dataset = datasets.MissingValuesPemsBay(p_fault=0., p_noise=0.25)
-    elif dataset_name == 'manglaria':
+    if dataset_name == 'manglaria':
     # ── CARGA Y PREPARACIÓN ───────────────────────────────────────────────────
         DATA_PATH     = 'manglaria_abril_timeseries.csv'
         TIMESTAMP_COL = 'TIMESTAMP'
@@ -105,7 +81,7 @@ def get_dataset(dataset_name):
                 else:
                     eval_mask_np = (df.isnull()).values.astype(np.uint8)
                 self._eval_mask = eval_mask_np.reshape(T, N, 1)
-                
+
                 # ── ÍNDICE ────────────────────────────────────────────────────
                 self._index = np.arange(T)
 
@@ -157,6 +133,153 @@ def get_dataset(dataset_name):
                 return adj
     
         return ManglarIAAdapter(df_num)
+    elif dataset_name == 'mexflux':
+
+        DATA_PATH     = 'mexflux.csv'
+        TIMESTAMP_COL = 'timestamp'
+        TIMESTAMP_FMT = '%Y-%m-%d %H:%M:%S.%f UTC'
+        SITE_COL      = 'site_id'
+
+        # Columnas a excluir — no son variables de medición
+        EXCLUIR = ['primary_key', 'timestamp', 'DOY', 'site_id']
+
+        df_raw = pd.read_csv(DATA_PATH)
+        df_raw[TIMESTAMP_COL] = pd.to_datetime(
+            df_raw[TIMESTAMP_COL], format=TIMESTAMP_FMT, utc=True
+        )
+
+        # Separar por sensor
+        sensores = sorted(df_raw[SITE_COL].unique())  # ['RBMNN', 'RBRL']
+        var_cols  = [c for c in df_raw.columns if c not in EXCLUIR]
+
+        # Construir índice temporal unificado con todos los timestamps
+        # de ambos sensores combinados y ordenados
+        todos_timestamps = pd.DatetimeIndex(
+            pd.concat([df_raw[df_raw[SITE_COL] == s][TIMESTAMP_COL]
+                    for s in sensores])
+        ).unique().sort_values()
+
+        # Crear DataFrame por sensor con el índice unificado
+        # Las filas donde el sensor no tiene medición quedan como NaN
+        dfs = {}
+        for s in sensores:
+            sub = df_raw[df_raw[SITE_COL] == s].copy()
+
+            # ── ELIMINAR DUPLICADOS POR TIMESTAMP ───────────────
+            sub = sub.sort_values(TIMESTAMP_COL)
+            sub = sub.drop_duplicates(subset=[TIMESTAMP_COL], keep='last')
+
+            sub = sub.set_index(TIMESTAMP_COL)
+            sub = sub[var_cols]
+
+            dfs[s] = sub.reindex(todos_timestamps)
+
+        class MexFluxAdapter:
+            def __init__(self, dfs, sensores, todos_timestamps):
+                import numpy as np
+                import pandas as pd
+
+                T  = len(todos_timestamps)
+                N  = len(sensores)       # 2 sensores = 2 nodos
+                d  = len(var_cols)       # 23 variables
+
+                # ── DATOS (T, N, d) ───────────────────────────────────────────
+                # Apilamos los dos sensores en la dimensión N
+                datos_raw = np.stack(
+                    [dfs[s].values for s in sensores], axis=1
+                )  # (T, N, d)
+
+                # ── MÁSCARA ───────────────────────────────────────────────────
+                # 1 = dato presente, 0 = faltante (real o por ausencia del sensor)
+                mask_np = np.stack(
+                    [(~dfs[s].isnull()).values for s in sensores], axis=1
+                ).astype(np.uint8)  # (T, N, d)
+                self._mask_full = mask_np
+
+                # ── FILL + NORMALIZACIÓN ──────────────────────────────────────
+                # Primero llenamos NaN para poder normalizar
+                datos_filled = np.copy(datos_raw)
+                for n in range(N):
+                    df_tmp = pd.DataFrame(datos_raw[:, n, :])
+                    df_tmp = df_tmp.ffill().bfill().fillna(0.0)
+                    datos_filled[:, n, :] = df_tmp.values
+
+                # Normalización z-score sobre el 70% de train
+                # Calculamos media y std sobre todos los sensores combinados
+                n_train = int(T * 0.7)
+                datos_train = datos_filled[:n_train]  # (n_train, N, d)
+
+                # Media y std por variable (promediando sobre T y N)
+                self._mean = datos_train.reshape(-1, d).mean(axis=0)  # (d,)
+                self._std  = datos_train.reshape(-1, d).std(axis=0)   # (d,)
+                self._std[self._std == 0] = 1.0  # evitar división por cero
+
+                datos_norm = (datos_filled - self._mean) / self._std  # (T, N, d)
+                self._data  = datos_norm
+
+                # ── EVAL MASK ─────────────────────────────────────────────────
+                # Huecos reales = donde el sensor no tenía medición
+                eval_mask_np = (1 - mask_np).astype(np.uint8)  # (T, N, d)
+                self._eval_mask = eval_mask_np
+
+                # ── ÍNDICE ────────────────────────────────────────────────────
+                self._index = np.arange(T)
+
+                # ── ADYACENCIA ────────────────────────────────────────────────
+                # Grafo totalmente conectado entre los 2 sensores
+                adj = np.ones((N, N), dtype=float)
+                np.fill_diagonal(adj, 0.0)
+                self._adj = adj
+
+                # ── DATAFRAME para análisis post-entrenamiento ─────────────────
+                # Aplanamos (T, N, d) → (T, N*d) para compatibilidad
+                self.df = pd.DataFrame(
+                    datos_norm.reshape(T, N * d),
+                    index=todos_timestamps
+                )
+                self._N = N
+                self._T = T
+                self._d = d
+
+                print(f"MexFlux cargado: T={T}, N={N} sensores, d={d} variables")
+                print(f"  Sensores: {sensores}")
+                for i, s in enumerate(sensores):
+                    n_presentes = mask_np[:, i, 0].sum()
+                    pct = n_presentes / T * 100
+                    print(f"  {s}: {n_presentes}/{T} pasos con datos ({pct:.1f}%)")
+
+            def numpy(self, return_idx=False):
+                if return_idx:
+                    return self._data, self._index
+                return self._data
+
+            @property
+            def training_mask(self):
+                return self._mask_full & (1 - self._eval_mask)
+
+            @property
+            def eval_mask(self):
+                return self._eval_mask
+
+            def splitter(self, dataset, val_len=0.1, test_len=0.2):
+                import numpy as np
+                n       = len(dataset)
+                n_test  = int(n * test_len)
+                n_val   = int(n * val_len)
+                n_train = n - n_test - n_val
+                return [
+                    np.arange(0, n_train),
+                    np.arange(n_train, n_train + n_val),
+                    np.arange(n_train + n_val, n)
+                ]
+
+            def get_similarity(self, thr=0., sparse=False, **kwargs):
+                import numpy as np
+                adj = self._adj.copy()
+                adj[adj < thr] = 0.
+                return adj
+
+        return MexFluxAdapter(dfs, sensores, todos_timestamps)
     elif dataset_name == 'synthetic':
         from lib.datasets.synthetic import ChargedParticles
         
@@ -246,7 +369,7 @@ def parse_args():
     # Argument parser
     parser = ArgumentParser()
     parser.add_argument('--seed', type=int, default=-1)
-    parser.add_argument("--model-name", type=str, default='brits')
+    parser.add_argument("--model-name", type=str, default='grin')
     parser.add_argument("--dataset-name", type=str, default='air36')
     parser.add_argument("--config", type=str, default=None)
     # Splitting/aggregation params
@@ -270,11 +393,6 @@ def parse_args():
     parser.add_argument('--warm-up', type=int, default=0)
     # graph params
     parser.add_argument("--adj-threshold", type=float, default=0.1)
-    # gain hparams
-    parser.add_argument('--alpha', type=float, default=10.)
-    parser.add_argument('--hint-rate', type=float, default=0.7)
-    parser.add_argument('--g-train-freq', type=int, default=1)
-    parser.add_argument('--d-train-freq', type=int, default=5)
 
     known_args, _ = parser.parse_known_args()
     model_cls, _ = get_model_classes(known_args.model_name)
@@ -378,11 +496,7 @@ def run_experiment(args):
                                      scheduler_kwargs={
                                          'eta_min': 0.0001,
                                          'T_max': args.epochs
-                                     },
-                                     alpha=args.alpha,
-                                     hint_rate=args.hint_rate,
-                                     g_train_freq=args.g_train_freq,
-                                     d_train_freq=args.d_train_freq)
+                                     })
     filler_kwargs = parser_utils.filter_args(args={**vars(args), **additional_filler_hparams},
                                              target_cls=filler_cls,
                                              return_dict=True)
@@ -423,8 +537,8 @@ def run_experiment(args):
 
     with torch.no_grad():
         y_true, y_hat, mask = filler.predict_loader(dm.test_dataloader(), return_mask=True)
-    y_hat = y_hat.detach().cpu().numpy().reshape(y_hat.shape[0], y_hat.shape[1], -1) # reshape to (eventually) squeeze node channels
-
+    y_hat = y_hat.detach().cpu().numpy().reshape(y_hat.shape[0], y_hat.shape[1], -1)
+ 
     # Test imputations in whole series
     try:
         eval_mask = dataset.eval_mask[dm.test_slice]
@@ -435,20 +549,41 @@ def run_experiment(args):
             'mre': numpy_metrics.masked_mre,
             'mape': numpy_metrics.masked_mape
         }
-        # Aggregate predictions in dataframes
         index = dm.torch_dataset.data_timestamps(dm.testset.indices, flatten=False)['horizon']
         aggr_methods = ensure_list(args.aggregate_by)
         df_hats = prediction_dataframe(y_hat, index, dataset.df.columns, aggregate_by=aggr_methods)
         df_hats = dict(zip(aggr_methods, df_hats))
         for aggr_by, df_hat in df_hats.items():
-            # Compute error
             print(f'- AGGREGATE BY {aggr_by.upper()}')
             for metric_name, metric_fn in metrics.items():
                 error = metric_fn(df_hat.values, df_true.values, eval_mask).item()
                 print(f' {metric_name}: {error:.4f}')
     except Exception as e:
-        print(f'[Skipping post-hoc analysis for synthetic data: {e}]')
-        
+        print(f'[Skipping post-hoc analysis: {e}]')
+ 
+    # ── GUARDAR RESULTADOS ESTRUCTURADOS ──────────────────────────────────────
+    # Si GRIN_OUTPUT_PATH está definido, guarda arrays para análisis posterior
+    output_path = os.environ.get('GRIN_OUTPUT_PATH', '')
+    if output_path:
+        y_true_np = y_true.detach().cpu().numpy()
+        mask_np   = mask.detach().cpu().numpy()
+ 
+        # Obtener el índice temporal del test si el dataset lo tiene
+        try:
+            timestamps = dataset.df.index[dm.test_slice].astype(str).tolist()
+        except Exception:
+            timestamps = []
+ 
+        # Guardar como .npz comprimido — eficiente para arrays grandes
+        np.savez_compressed(
+            output_path,
+            y_hat       = y_hat,
+            y_true      = y_true_np.reshape(y_true_np.shape[0], y_true_np.shape[1], -1),
+            mask        = mask_np.reshape(mask_np.shape[0], mask_np.shape[1], -1),
+            timestamps  = np.array(timestamps, dtype=str),
+        )
+        print(f'[Resultados guardados en: {output_path}.npz]')
+ 
     return y_true, y_hat, mask
 
 

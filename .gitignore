@@ -21,3 +21,7 @@ resultados_patrones/config_*.yaml
 logs/
 __pycache__/
 *.pyc
+
+mexflux.csv
+resultados_manglaria_v2/
+resultados_mexflux/

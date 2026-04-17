@@ -1,7 +1,5 @@
-import warnings
-from pytorch_lightning.utilities.warnings import LightningDeprecationWarning
-
-warnings.filterwarnings("ignore", category=LightningDeprecationWarning)
+"""
+run_imputation2.py"""
 
 import copy
 import datetime
@@ -41,7 +39,7 @@ def get_model_classes(model_str):
     return model, filler
 
 
-def get_dataset(dataset_name, args):
+def get_dataset(dataset_name):
     if dataset_name == 'manglaria':
     # ── CARGA Y PREPARACIÓN ───────────────────────────────────────────────────
         DATA_PATH     = 'manglaria_abril_timeseries.csv'
@@ -50,12 +48,10 @@ def get_dataset(dataset_name, args):
     
         df_raw = pd.read_csv(DATA_PATH)
         df_raw[TIMESTAMP_COL] = pd.to_datetime(
-            df_raw[TIMESTAMP_COL], format=TIMESTAMP_FMT, utc=True
+            df_raw[TIMESTAMP_COL], format=TIMESTAMP_FMT
         )
         df_raw = df_raw.sort_values(TIMESTAMP_COL).reset_index(drop=True)
         df_raw = df_raw.set_index(TIMESTAMP_COL)
-        # redundante pero seguro
-        df_raw.index = df_raw.index.tz_convert("UTC")
     
         # Solo columnas numéricas — excluye TIMESTAMP automáticamente
         df_num = df_raw.select_dtypes(include=[np.number])
@@ -67,28 +63,6 @@ def get_dataset(dataset_name, args):
                 import pandas as pd
 
                 T, N = df.shape
-
-                timestamps = df.index
-
-                # densidad por timestep
-                densidad_t = (~df.isnull()).mean(axis=1)
-
-                # params
-                train_start = pd.to_datetime(args.train_start, utc=True)
-                train_end   = pd.to_datetime(args.train_end, utc=True)
-                min_density = args.min_density
-
-                mask_density = (densidad_t >= min_density)
-
-                mask_time = np.ones(len(df), dtype=bool)
-                if train_start:
-                    mask_time &= (timestamps >= pd.Timestamp(train_start))
-                if train_end:
-                    mask_time &= (timestamps <= pd.Timestamp(train_end))
-
-                train_time_mask = (mask_density & mask_time).astype(np.uint8)
-
-                self._train_time_mask = train_time_mask.reshape(len(df), 1, 1)
 
                 # ── MÁSCARA ───────────────────────────────────────────────────
                 mask_np         = (~df.isnull()).values.astype(np.uint8)
@@ -104,12 +78,25 @@ def get_dataset(dataset_name, args):
 
                # ── EVAL MASK ─────────────────────────────────────────────────────
                 mask_path = os.environ.get('GRIN_MASK_PATH', '')
+                print(f"DEBUG [Adapter]: GRIN_MASK_PATH = {mask_path}")
+
+                # 1. Huecos reales del dataset
+                real_mask = df.isnull().values.astype(np.uint8)  # (T, N)
+                print(f"DEBUG [Adapter]: real_mask shape={real_mask.shape}, missing%={real_mask.mean()*100:.2f}%")
+
+                # 2. Máscara artificial (si se proporcionó)
                 if mask_path and os.path.exists(mask_path):
-                    artificial = np.load(mask_path).astype(np.uint8)  # (T, N)
-                    eval_mask_np = artificial
+                    artificial = np.load(mask_path).astype(np.uint8)
+                    print(f"DEBUG [Adapter]: artificial mask loaded, shape={artificial.shape}, missing%={artificial.mean()*100:.2f}%")
+                    # Unión: un hueco es missing si es real O artificial
+                    eval_mask_np = np.logical_or(real_mask, artificial).astype(np.uint8)
+                    print(f"DEBUG [Adapter]: combined mask missing%={eval_mask_np.mean()*100:.2f}%")
                 else:
-                    eval_mask_np = (df.isnull()).values.astype(np.uint8)
+                    print("DEBUG [Adapter]: No external mask, using only real missing")
+                    eval_mask_np = real_mask
+
                 self._eval_mask = eval_mask_np.reshape(T, N, 1)
+                print(f"DEBUG [Adapter]: final eval_mask shape={self._eval_mask.shape}")
 
                 # ── ÍNDICE ────────────────────────────────────────────────────
                 self._index = np.arange(T)
@@ -134,7 +121,7 @@ def get_dataset(dataset_name, args):
                 # Datos visibles durante entrenamiento:
                 # presentes en el CSV menos los reservados para evaluación
                 # Con tan pocos huecos reales (0.2%) training_mask ≈ mask_full
-                return self._mask_full & (1 - self._eval_mask) & self._train_time_mask
+                return self._mask_full & (1 - self._eval_mask)
     
             @property
             def eval_mask(self):
@@ -208,96 +195,74 @@ def get_dataset(dataset_name, args):
                 import numpy as np
                 import pandas as pd
 
-                T = len(todos_timestamps)
-                N = len(sensores)
-                d = len(var_cols)
+                T  = len(todos_timestamps)
+                N  = len(sensores)       # 2 sensores = 2 nodos
+                d  = len(var_cols)       # 23 variables
 
-                # ── DATOS Y MÁSCARA COMPLETOS ─────────────────────────────────────
-                datos_raw = np.stack([dfs[s].values for s in sensores], axis=1)  # (T, N, d)
-                mask_np   = np.stack(
+                # ── DATOS (T, N, d) ───────────────────────────────────────────
+                # Apilamos los dos sensores en la dimensión N
+                datos_raw = np.stack(
+                    [dfs[s].values for s in sensores], axis=1
+                )  # (T, N, d)
+
+                # ── MÁSCARA ───────────────────────────────────────────────────
+                # 1 = dato presente, 0 = faltante (real o por ausencia del sensor)
+                mask_np = np.stack(
                     [(~dfs[s].isnull()).values for s in sensores], axis=1
                 ).astype(np.uint8)  # (T, N, d)
+                self._mask_full = mask_np
 
-                # ── EVAL MASK ─────────────────────────────────────────────────────
-                mask_path = os.environ.get('GRIN_MASK_PATH', '').strip()
-                if mask_path and os.path.exists(mask_path):
-                    artificial = np.load(mask_path).astype(np.uint8)
-                    if artificial.ndim == 2:
-                        artificial = np.stack([artificial] * d, axis=-1)
-                    eval_mask_np = artificial
-                    print(f"  Eval mask artificial: {eval_mask_np.mean()*100:.2f}% huecos")
-                else:
-                    eval_mask_np = (1 - mask_np).astype(np.uint8)
-
-                # ── FILTRO TEMPORAL ───────────────────────────────────────────────
-                # Lee desde variables de entorno (compatibilidad) o desde args
-                train_start_str = os.environ.get('TRAIN_START', '').strip()
-                train_end_str   = os.environ.get('TRAIN_END',   '').strip()
-                min_density     = float(os.environ.get('MIN_DENSITY', '0.0'))
-
-                densidad_t = mask_np.mean(axis=(1, 2))  # (T,)
-                keep       = np.ones(T, dtype=bool)
-
-                if train_start_str:
-                    start_ts = pd.Timestamp(train_start_str).tz_localize('UTC')
-                    keep &= (todos_timestamps >= start_ts)
-                    print(f"  Filtrando desde: {start_ts}")
-                if train_end_str:
-                    end_ts = pd.Timestamp(train_end_str).tz_localize('UTC')
-                    keep &= (todos_timestamps <= end_ts)
-                    print(f"  Filtrando hasta: {end_ts}")
-
-                keep &= (densidad_t >= min_density)
-                n_keep = int(keep.sum())
-                print(f"  Train density ≥ {min_density}: {n_keep} / {T} timesteps")
-
-                # ── RECORTAR TODO AL PERÍODO LIMPIO ───────────────────────────────
-                # Si hay filtro, recortar — si no, usar todo
-                if train_start_str or train_end_str:
-                    todos_timestamps = todos_timestamps[keep]
-                    datos_raw        = datos_raw[keep]
-                    mask_np          = mask_np[keep]
-                    eval_mask_np     = eval_mask_np[keep]
-                    T = int(keep.sum())
-
-                # ── FILL + NORMALIZACIÓN ──────────────────────────────────────────
+                # ── FILL + NORMALIZACIÓN ──────────────────────────────────────
+                # Primero llenamos NaN para poder normalizar
                 datos_filled = np.copy(datos_raw)
                 for n in range(N):
                     df_tmp = pd.DataFrame(datos_raw[:, n, :])
                     df_tmp = df_tmp.ffill().bfill().fillna(0.0)
                     datos_filled[:, n, :] = df_tmp.values
 
-                n_train     = int(T * 0.7)
-                datos_train = datos_filled[:n_train].reshape(-1, d)
-                self._mean  = datos_train.mean(axis=0)
-                self._std   = datos_train.std(axis=0)
-                self._std[self._std == 0] = 1.0
-                datos_norm = (datos_filled - self._mean) / self._std
+                # Normalización z-score sobre el 70% de train
+                # Calculamos media y std sobre todos los sensores combinados
+                n_train = int(T * 0.7)
+                datos_train = datos_filled[:n_train]  # (n_train, N, d)
 
-                # ── ASIGNACIÓN FINAL ──────────────────────────────────────────────
-                self._data      = datos_norm
-                self._mask_full = mask_np
+                # Media y std por variable (promediando sobre T y N)
+                self._mean = datos_train.reshape(-1, d).mean(axis=0)  # (d,)
+                self._std  = datos_train.reshape(-1, d).std(axis=0)   # (d,)
+                self._std[self._std == 0] = 1.0  # evitar división por cero
+
+                datos_norm = (datos_filled - self._mean) / self._std  # (T, N, d)
+                self._data  = datos_norm
+
+                # ── EVAL MASK ─────────────────────────────────────────────────
+                # Huecos reales = donde el sensor no tenía medición
+                eval_mask_np = (1 - mask_np).astype(np.uint8)  # (T, N, d)
                 self._eval_mask = eval_mask_np
-                self._index     = np.arange(T)
-                self._T         = T
-                self._N         = N
-                self._d         = d
 
+                # ── ÍNDICE ────────────────────────────────────────────────────
+                self._index = np.arange(T)
+
+                # ── ADYACENCIA ────────────────────────────────────────────────
                 # Grafo totalmente conectado entre los 2 sensores
                 adj = np.ones((N, N), dtype=float)
                 np.fill_diagonal(adj, 0.0)
                 self._adj = adj
 
+                # ── DATAFRAME para análisis post-entrenamiento ─────────────────
+                # Aplanamos (T, N, d) → (T, N*d) para compatibilidad
                 self.df = pd.DataFrame(
                     datos_norm.reshape(T, N * d),
                     index=todos_timestamps
                 )
+                self._N = N
+                self._T = T
+                self._d = d
 
                 print(f"MexFlux cargado: T={T}, N={N} sensores, d={d} variables")
-                print(f"  Período: {todos_timestamps.min()} → {todos_timestamps.max()}")
+                print(f"  Sensores: {sensores}")
                 for i, s in enumerate(sensores):
-                    n_pres = int(mask_np[:, i, 0].sum())
-                    print(f"  {s}: {n_pres}/{T} pasos con datos ({n_pres/T*100:.1f}%)")
+                    n_presentes = mask_np[:, i, 0].sum()
+                    pct = n_presentes / T * 100
+                    print(f"  {s}: {n_presentes}/{T} pasos con datos ({pct:.1f}%)")
 
             def numpy(self, return_idx=False):
                 if return_idx:
@@ -318,7 +283,6 @@ def get_dataset(dataset_name, args):
                 n_test  = int(n * test_len)
                 n_val   = int(n * val_len)
                 n_train = n - n_test - n_val
-
                 return [
                     np.arange(0, n_train),
                     np.arange(n_train, n_train + n_val),
@@ -445,10 +409,6 @@ def parse_args():
     parser.add_argument('--warm-up', type=int, default=0)
     # graph params
     parser.add_argument("--adj-threshold", type=float, default=0.1)
-    # entrenamiento mínimo
-    parser.add_argument('--train-start', type=str, default=None)
-    parser.add_argument('--train-end',   type=str, default=None)
-    parser.add_argument('--min-density', type=float, default=0.3)
 
     known_args, _ = parser.parse_known_args()
     model_cls, _ = get_model_classes(known_args.model_name)
@@ -474,8 +434,21 @@ def run_experiment(args):
     torch.set_num_threads(1)
     pl.seed_everything(args.seed)
 
+    # === DEBUG: Verificar máscara externa ===
+    mask_path_env = os.environ.get('GRIN_MASK_PATH', '')
+    print(f"DEBUG: GRIN_MASK_PATH = {mask_path_env}")
+
     model_cls, filler_cls = get_model_classes(args.model_name)
-    dataset = get_dataset(args.dataset_name, args)
+    print("DEBUG: Creando dataset...")
+    dataset = get_dataset(args.dataset_name)
+    print("DEBUG: Dataset creado")
+
+     # === DEBUG: Verificar máscara final del dataset ===
+    if hasattr(dataset, 'eval_mask'):
+        eval_mask = dataset.eval_mask
+        print(f"DEBUG: dataset.eval_mask shape={eval_mask.shape}, missing%={eval_mask.mean()*100:.2f}%")
+    else:
+        print("DEBUG: dataset no tiene eval_mask")
 
     ########################################
     # create logdir and save configuration #
@@ -503,12 +476,22 @@ def run_experiment(args):
     # get train/val/test indices
     split_conf = parser_utils.filter_function_args(args, dataset.splitter, return_dict=True)
     train_idxs, val_idxs, test_idxs = dataset.splitter(torch_dataset, **split_conf)
+    print(f"DEBUG: train_idxs length={len(train_idxs)}, val_idxs={len(val_idxs)}, test_idxs={len(test_idxs)}")
 
     # configure datamodule
     data_conf = parser_utils.filter_args(args, SpatioTemporalDataModule, return_dict=True)
     dm = SpatioTemporalDataModule(torch_dataset, train_idxs=train_idxs, val_idxs=val_idxs, test_idxs=test_idxs,
                                   **data_conf)
     dm.setup()
+
+    # === DEBUG: Verificar slices del DataModule ===
+    print(f"DEBUG: dm.train_slice = {dm.train_slice}")
+    print(f"DEBUG: dm.val_slice = {dm.val_slice}")
+    print(f"DEBUG: dm.test_slice = {dm.test_slice}")
+    print(f"DEBUG: test_slice length = {len(dm.test_slice) if dm.test_slice is not None else 0}")
+    if dm.test_slice is not None and len(dm.test_slice) == 0:
+        print("ERROR: test_slice vacío, no hay datos para evaluar")
+        # Opcional: salir o retornar algo vacío
 
     # if out of sample in air, add values removed for evaluation in train set
     if not args.in_sample and args.dataset_name[:3] == 'air':
@@ -574,10 +557,11 @@ def run_experiment(args):
                          gpus=1 if torch.cuda.is_available() else None,
                          gradient_clip_val=args.grad_clip_val,
                          gradient_clip_algorithm=args.grad_clip_algorithm,
-                         callbacks=[early_stop_callback, checkpoint_callback]
-                         )
+                         callbacks=[early_stop_callback, checkpoint_callback])
 
+    print("DEBUG: Iniciando entrenamiento...")
     trainer.fit(filler, datamodule=dm)
+    print("DEBUG: Entrenamiento completado")
 
     ########################################
     # testing                              #
@@ -586,21 +570,25 @@ def run_experiment(args):
     filler.load_state_dict(torch.load(checkpoint_callback.best_model_path,
                                       lambda storage, loc: storage)['state_dict'])
     filler.freeze()
+    print("DEBUG: Iniciando testing (trainer.test)...")
     trainer.test()
+    print("DEBUG: trainer.test completado")
     filler.eval()
 
     if torch.cuda.is_available():
         filler.cuda()
-
+    
+    print("DEBUG: Ejecutando predict_loader...")
     with torch.no_grad():
         y_true, y_hat, mask = filler.predict_loader(dm.test_dataloader(), return_mask=True)
+    print("DEBUG: predict_loader completado")
+    print(f"DEBUG: y_true shape (tensor): {y_true.shape}, y_hat: {y_hat.shape}, mask: {mask.shape}")    
     y_hat = y_hat.detach().cpu().numpy().reshape(y_hat.shape[0], y_hat.shape[1], -1)
- 
+    print(f"DEBUG: y_hat convertido a numpy, shape={y_hat.shape}")
+
     # Test imputations in whole series
     try:
-        _T_total = dataset.eval_mask.shape[0]
-        _T = dataset.eval_mask.shape[0]
-        eval_mask = dataset.eval_mask.reshape(_T, -1)[dm.test_slice]
+        eval_mask = dataset.eval_mask[dm.test_slice]
         df_true = dataset.df.iloc[dm.test_slice]
         metrics = {
             'mae': numpy_metrics.masked_mae,
@@ -623,27 +611,37 @@ def run_experiment(args):
     # ── GUARDAR RESULTADOS ESTRUCTURADOS ──────────────────────────────────────
     # Si GRIN_OUTPUT_PATH está definido, guarda arrays para análisis posterior
     output_path = os.environ.get('GRIN_OUTPUT_PATH', '')
+    print(f"DEBUG: GRIN_OUTPUT_PATH = {output_path}")
     if output_path:
+        print("DEBUG: Convirtiendo tensores a numpy...")
         y_true_np = y_true.detach().cpu().numpy()
         mask_np   = mask.detach().cpu().numpy()
+        print(f"DEBUG: y_true_np shape={y_true_np.shape}, mask_np shape={mask_np.shape}")
  
         # Obtener el índice temporal del test si el dataset lo tiene
         try:
             timestamps = dataset.df.index[dm.test_slice].astype(str).tolist()
+            print(f"DEBUG: timestamps obtenidos, longitud {len(timestamps)}")
         except Exception:
+            print(f"DEBUG: Error obteniendo timestamps: {e}")
             timestamps = []
- 
+        print(f"DEBUG: Guardando en {output_path}")
         # Guardar como .npz comprimido — eficiente para arrays grandes
         np.savez_compressed(
             output_path,
-            y_hat = y_hat,
-            y_true = y_true_np.reshape(y_true_np.shape[0], y_true_np.shape[1], -1),
-            mask = dm.torch_dataset.eval_mask[dm.test_slice].reshape(mask_np.shape[0], mask_np.shape[1], -1),
+            y_hat      = y_hat,
+            y_true     = y_true_np.reshape(y_true_np.shape[0], y_true_np.shape[1], -1),
+            mask       = dm.torch_dataset.eval_mask[dm.test_slice].reshape(
+                            mask_np.shape[0], mask_np.shape[1], -1),  # ← eval_mask, no mask
             timestamps = np.array(timestamps, dtype=str),
         )
+        print("DEBUG: Guardado exitoso")
         print(f'[Resultados guardados en: {output_path}.npz]')
+    else:
+        print("DEBUG: GRIN_OUTPUT_PATH no definido, no se guarda resultado")
  
     return y_true, y_hat, mask
+ 
 
 
 if __name__ == '__main__':

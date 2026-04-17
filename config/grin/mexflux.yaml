@@ -3,13 +3,13 @@
 # Dos sensores (RBRL, RBMNN), 23 variables, frecuencia 30 min
 
 # Datos
-window: 48          # ventana de 48 pasos = 24 horas
+window: 8          # ventana de 8 pasos = 4 horas
 stride: 1
 
 # Entrenamiento
 epochs: 12
 batch_size: 32
-lr: 0.001
+lr: 0.0001
 patience: 10
 
 # Optimizador

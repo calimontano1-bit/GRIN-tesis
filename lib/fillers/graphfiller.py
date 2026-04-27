@@ -54,10 +54,12 @@ class GraphFiller(Filler):
         # Compute predictions and compute loss
         res = self.predict_batch(batch, preprocess=False, postprocess=False)
         imputation, predictions = (res[0], res[1:]) if isinstance(res, (list, tuple)) else (res, [])
+        if len(predictions) == 1 and predictions[0].dim() == imputation.dim() + 1:
+            predictions = torch.unbind(predictions[0], dim=0)
 
         # trim to imputation horizon len
         imputation, mask, eval_mask, y = self.trim_seq(imputation, mask, eval_mask, y)
-        predictions = self.trim_seq(*predictions)
+        predictions = self.trim_seq(*predictions) if len(predictions) else []
 
         if self.scaled_target:
             target = self._preprocess(y, batch_preprocessing)

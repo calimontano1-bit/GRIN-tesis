@@ -1,5 +1,6 @@
 """
-run_imputation2.py"""
+run_imputation2.py
+"""
 
 import copy
 import datetime
@@ -29,6 +30,28 @@ from lib.utils.parser_utils import str_to_bool
 
 def has_graph_support(model_cls):
     return model_cls in [models.GRINet]
+
+
+def window_time_array(values, starts, window, name='array'):
+    values = values.detach().cpu().numpy() if isinstance(values, torch.Tensor) else np.asarray(values)
+    starts = np.asarray(starts, dtype=int)
+
+    if values.ndim == 2:
+        values = values[..., None]
+    if values.ndim != 3:
+        raise ValueError(f'{name} must have shape (T, N, d) or (T, N), got {values.shape}')
+    if starts.size == 0:
+        return values[:0].reshape(0, window, -1)
+
+    max_end = int(starts.max()) + window
+    if starts.min() < 0 or max_end > values.shape[0]:
+        raise ValueError(
+            f'{name} windows out of bounds: starts=[{starts.min()}, {starts.max()}], '
+            f'window={window}, T={values.shape[0]}'
+        )
+
+    windows = np.stack([values[start:start + window] for start in starts], axis=0)
+    return windows.reshape(len(starts), window, -1)
 
 
 def get_model_classes(model_str):
@@ -66,6 +89,7 @@ def get_dataset(dataset_name):
 
                 # ── MÁSCARA ───────────────────────────────────────────────────
                 mask_np         = (~df.isnull()).values.astype(np.uint8)
+                self._observed_mask = mask_np  # (T, N, 1)
                 self._mask_full = mask_np.reshape(T, N, 1)
 
                 # ── FILL + NORMALIZACIÓN ──────────────────────────────────────
@@ -78,25 +102,25 @@ def get_dataset(dataset_name):
 
                # ── EVAL MASK ─────────────────────────────────────────────────────
                 mask_path = os.environ.get('GRIN_MASK_PATH', '')
-                print(f"DEBUG [Adapter]: GRIN_MASK_PATH = {mask_path}")
+                #print(f"DEBUG [Adapter]: GRIN_MASK_PATH = {mask_path}")
 
                 # 1. Huecos reales del dataset
                 real_mask = df.isnull().values.astype(np.uint8)  # (T, N)
-                print(f"DEBUG [Adapter]: real_mask shape={real_mask.shape}, missing%={real_mask.mean()*100:.2f}%")
+                #print(f"DEBUG [Adapter]: real_mask shape={real_mask.shape}, missing%={real_mask.mean()*100:.2f}%")
 
                 # 2. Máscara artificial (si se proporcionó)
                 if mask_path and os.path.exists(mask_path):
                     artificial = np.load(mask_path).astype(np.uint8)
-                    print(f"DEBUG [Adapter]: artificial mask loaded, shape={artificial.shape}, missing%={artificial.mean()*100:.2f}%")
+                    #print(f"DEBUG [Adapter]: artificial mask loaded, shape={artificial.shape}, missing%={artificial.mean()*100:.2f}%")
                     # Unión: un hueco es missing si es real O artificial
                     eval_mask_np = np.logical_or(real_mask, artificial).astype(np.uint8)
-                    print(f"DEBUG [Adapter]: combined mask missing%={eval_mask_np.mean()*100:.2f}%")
+                    #print(f"DEBUG [Adapter]: combined mask missing%={eval_mask_np.mean()*100:.2f}%")
                 else:
-                    print("DEBUG [Adapter]: No external mask, using only real missing")
+                    #print("DEBUG [Adapter]: No external mask, using only real missing")
                     eval_mask_np = real_mask
 
                 self._eval_mask = eval_mask_np.reshape(T, N, 1)
-                print(f"DEBUG [Adapter]: final eval_mask shape={self._eval_mask.shape}")
+                #print(f"DEBUG [Adapter]: final eval_mask shape={self._eval_mask.shape}")
 
                 # ── ÍNDICE ────────────────────────────────────────────────────
                 self._index = np.arange(T)
@@ -109,6 +133,7 @@ def get_dataset(dataset_name):
                 # ── DATAFRAME ─────────────────────────────────────────────────
                 self.df = df_norm
                 self._N = N
+                self._d = 1 
                 self._T = T
     
             def numpy(self, return_idx=False):
@@ -210,7 +235,29 @@ def get_dataset(dataset_name):
                 mask_np = np.stack(
                     [(~dfs[s].isnull()).values for s in sensores], axis=1
                 ).astype(np.uint8)  # (T, N, d)
+                original_timestamps = todos_timestamps
+                time_keep = np.ones(T, dtype=bool)
+                corte_inicio = os.environ.get('GRIN_CORTE_INICIO')
+                corte_fin = os.environ.get('GRIN_CORTE_FIN')
+                if corte_inicio and corte_fin:
+                    start_ts = pd.Timestamp(pd.to_datetime(corte_inicio, utc=True))
+                    end_ts = pd.Timestamp(pd.to_datetime(corte_fin, utc=True))
+                    if len(str(corte_fin)) <= 10:
+                        end_ts = end_ts + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+                    time_keep = (todos_timestamps >= start_ts) & (todos_timestamps <= end_ts)
+                    if not time_keep.any():
+                        raise ValueError(
+                            f"MexFlux corte {start_ts}..{end_ts} no intersecta "
+                            f"{todos_timestamps.min()}..{todos_timestamps.max()}"
+                        )
+                    todos_timestamps = todos_timestamps[time_keep]
+                    datos_raw = datos_raw[time_keep]
+                    mask_np = mask_np[time_keep]
+                    T = len(todos_timestamps)
+                    print(f"DEBUG [MexFluxAdapter]: recorte temporal {start_ts}..{end_ts} -> "
+                          f"T={T}, rango={todos_timestamps.min()}..{todos_timestamps.max()}")
                 self._mask_full = mask_np
+                self._observed_mask = mask_np.copy()  # (T, N, d)
 
                 # ── FILL + NORMALIZACIÓN ──────────────────────────────────────
                 # Primero llenamos NaN para poder normalizar
@@ -231,11 +278,29 @@ def get_dataset(dataset_name):
                 self._std[self._std == 0] = 1.0  # evitar división por cero
 
                 datos_norm = (datos_filled - self._mean) / self._std  # (T, N, d)
+                datos_norm = np.nan_to_num(datos_norm, nan=0.0, posinf=0.0, neginf=0.0)
                 self._data  = datos_norm
 
                 # ── EVAL MASK ─────────────────────────────────────────────────
                 # Huecos reales = donde el sensor no tenía medición
-                eval_mask_np = (1 - mask_np).astype(np.uint8)  # (T, N, d)
+                mask_path = os.environ.get('GRIN_MASK_PATH', '')
+                if mask_path and os.path.exists(mask_path):
+                    artificial = np.load(mask_path).astype(np.uint8)
+                    if artificial.shape[0] != T and artificial.shape[0] == len(original_timestamps):
+                        artificial = artificial[time_keep]
+                    if artificial.shape == (T, N):
+                        artificial = np.repeat(artificial[:, :, None], d, axis=2)
+                    if artificial.shape != (T, N, d):
+                        raise ValueError(
+                            f"GRIN_MASK_PATH shape {artificial.shape} no coincide con MexFlux "
+                            f"(T, N, d)=({T}, {N}, {d}). Regenera la mascara con experimentos3.py."
+                        )
+                    eval_mask_np = (artificial & mask_np).astype(np.uint8)
+                    print(f"DEBUG [MexFluxAdapter]: artificial eval_mask shape={eval_mask_np.shape}, "
+                          f"missing%={eval_mask_np.mean()*100:.2f}%")
+                else:
+                    eval_mask_np = np.zeros_like(mask_np, dtype=np.uint8)
+                    print("DEBUG [MexFluxAdapter]: sin GRIN_MASK_PATH; eval_mask artificial vacia")
                 self._eval_mask = eval_mask_np
 
                 # ── ÍNDICE ────────────────────────────────────────────────────
@@ -436,19 +501,19 @@ def run_experiment(args):
 
     # === DEBUG: Verificar máscara externa ===
     mask_path_env = os.environ.get('GRIN_MASK_PATH', '')
-    print(f"DEBUG: GRIN_MASK_PATH = {mask_path_env}")
+    #print(f"DEBUG: GRIN_MASK_PATH = {mask_path_env}")
 
     model_cls, filler_cls = get_model_classes(args.model_name)
-    print("DEBUG: Creando dataset...")
+    #print("DEBUG: Creando dataset...")
     dataset = get_dataset(args.dataset_name)
-    print("DEBUG: Dataset creado")
+    #print("DEBUG: Dataset creado")
 
      # === DEBUG: Verificar máscara final del dataset ===
     if hasattr(dataset, 'eval_mask'):
         eval_mask = dataset.eval_mask
-        print(f"DEBUG: dataset.eval_mask shape={eval_mask.shape}, missing%={eval_mask.mean()*100:.2f}%")
-    else:
-        print("DEBUG: dataset no tiene eval_mask")
+        #print(f"DEBUG: dataset.eval_mask shape={eval_mask.shape}, missing%={eval_mask.mean()*100:.2f}%")
+    #else:
+        #print("DEBUG: dataset no tiene eval_mask")
 
     ########################################
     # create logdir and save configuration #
@@ -476,7 +541,7 @@ def run_experiment(args):
     # get train/val/test indices
     split_conf = parser_utils.filter_function_args(args, dataset.splitter, return_dict=True)
     train_idxs, val_idxs, test_idxs = dataset.splitter(torch_dataset, **split_conf)
-    print(f"DEBUG: train_idxs length={len(train_idxs)}, val_idxs={len(val_idxs)}, test_idxs={len(test_idxs)}")
+    #print(f"DEBUG: train_idxs length={len(train_idxs)}, val_idxs={len(val_idxs)}, test_idxs={len(test_idxs)}")
 
     # configure datamodule
     data_conf = parser_utils.filter_args(args, SpatioTemporalDataModule, return_dict=True)
@@ -485,10 +550,10 @@ def run_experiment(args):
     dm.setup()
 
     # === DEBUG: Verificar slices del DataModule ===
-    print(f"DEBUG: dm.train_slice = {dm.train_slice}")
-    print(f"DEBUG: dm.val_slice = {dm.val_slice}")
-    print(f"DEBUG: dm.test_slice = {dm.test_slice}")
-    print(f"DEBUG: test_slice length = {len(dm.test_slice) if dm.test_slice is not None else 0}")
+    #print(f"DEBUG: dm.train_slice = {dm.train_slice}")
+    #print(f"DEBUG: dm.val_slice = {dm.val_slice}")
+    #print(f"DEBUG: dm.test_slice = {dm.test_slice}")
+    #print(f"DEBUG: test_slice length = {len(dm.test_slice) if dm.test_slice is not None else 0}")
     if dm.test_slice is not None and len(dm.test_slice) == 0:
         print("ERROR: test_slice vacío, no hay datos para evaluar")
         # Opcional: salir o retornar algo vacío
@@ -559,9 +624,9 @@ def run_experiment(args):
                          gradient_clip_algorithm=args.grad_clip_algorithm,
                          callbacks=[early_stop_callback, checkpoint_callback])
 
-    print("DEBUG: Iniciando entrenamiento...")
+    #print("DEBUG: Iniciando entrenamiento...")
     trainer.fit(filler, datamodule=dm)
-    print("DEBUG: Entrenamiento completado")
+    #print("DEBUG: Entrenamiento completado")
 
     ########################################
     # testing                              #
@@ -570,21 +635,21 @@ def run_experiment(args):
     filler.load_state_dict(torch.load(checkpoint_callback.best_model_path,
                                       lambda storage, loc: storage)['state_dict'])
     filler.freeze()
-    print("DEBUG: Iniciando testing (trainer.test)...")
+    #print("DEBUG: Iniciando testing (trainer.test)...")
     trainer.test()
-    print("DEBUG: trainer.test completado")
+    #print("DEBUG: trainer.test completado")
     filler.eval()
 
     if torch.cuda.is_available():
         filler.cuda()
     
-    print("DEBUG: Ejecutando predict_loader...")
+    #print("DEBUG: Ejecutando predict_loader...")
     with torch.no_grad():
         y_true, y_hat, mask = filler.predict_loader(dm.test_dataloader(), return_mask=True)
-    print("DEBUG: predict_loader completado")
-    print(f"DEBUG: y_true shape (tensor): {y_true.shape}, y_hat: {y_hat.shape}, mask: {mask.shape}")    
+    #print("DEBUG: predict_loader completado")
+    #print(f"DEBUG: y_true shape (tensor): {y_true.shape}, y_hat: {y_hat.shape}, mask: {mask.shape}")    
     y_hat = y_hat.detach().cpu().numpy().reshape(y_hat.shape[0], y_hat.shape[1], -1)
-    print(f"DEBUG: y_hat convertido a numpy, shape={y_hat.shape}")
+    #print(f"DEBUG: y_hat convertido a numpy, shape={y_hat.shape}")
 
     # Test imputations in whole series
     try:
@@ -611,34 +676,65 @@ def run_experiment(args):
     # ── GUARDAR RESULTADOS ESTRUCTURADOS ──────────────────────────────────────
     # Si GRIN_OUTPUT_PATH está definido, guarda arrays para análisis posterior
     output_path = os.environ.get('GRIN_OUTPUT_PATH', '')
-    print(f"DEBUG: GRIN_OUTPUT_PATH = {output_path}")
+    #print(f"DEBUG: GRIN_OUTPUT_PATH = {output_path}")
     if output_path:
-        print("DEBUG: Convirtiendo tensores a numpy...")
+        #print("DEBUG: Convirtiendo tensores a numpy...")
         y_true_np = y_true.detach().cpu().numpy()
         mask_np   = mask.detach().cpu().numpy()
-        print(f"DEBUG: y_true_np shape={y_true_np.shape}, mask_np shape={mask_np.shape}")
+        #print(f"DEBUG: y_true_np shape={y_true_np.shape}, mask_np shape={mask_np.shape}")
+        test_starts = dm.torch_dataset.indices[dm.testset.indices]
+        raw_eval_mask = dm.torch_dataset.eval_mask
+        raw_eval_mask_np = raw_eval_mask.detach().cpu().numpy() if isinstance(raw_eval_mask, torch.Tensor) else np.asarray(raw_eval_mask)
+        flat_test_eval_mask = raw_eval_mask_np[dm.test_slice]
+        eval_mask_windows = window_time_array(raw_eval_mask_np, test_starts, args.window, name='eval_mask')
+        mask_windows_from_loader = mask_np.reshape(mask_np.shape[0], mask_np.shape[1], -1)
+        #print(
+        #    "DEBUG: eval_mask raw/test/windowed shapes: "
+        #    f"raw={raw_eval_mask_np.shape}, test_slice={flat_test_eval_mask.shape} "
+        #    f"({flat_test_eval_mask.size} elems), starts={len(test_starts)}, "
+        #    f"window={args.window}, windowed={eval_mask_windows.shape}"
+        #)
+        assert eval_mask_windows.shape == mask_windows_from_loader.shape, (
+            f"eval_mask_windows shape {eval_mask_windows.shape} != loader mask shape {mask_windows_from_loader.shape}"
+        )
+        assert eval_mask_windows.shape[:2] == y_true_np.shape[:2], (
+            f"eval_mask_windows first dims {eval_mask_windows.shape[:2]} != y_true first dims {y_true_np.shape[:2]}"
+        )
+
+        raw_observed = getattr(dataset, '_observed_mask', None)
+        if raw_observed is not None:
+            observed_np = raw_observed if isinstance(raw_observed, np.ndarray) else raw_observed.detach().cpu().numpy()
+            observed_windows = window_time_array(observed_np, test_starts, args.window, name='observed_mask')
+        else:
+            observed_windows = np.zeros_like(eval_mask_windows)
  
         # Obtener el índice temporal del test si el dataset lo tiene
         try:
-            timestamps = dataset.df.index[dm.test_slice].astype(str).tolist()
-            print(f"DEBUG: timestamps obtenidos, longitud {len(timestamps)}")
+            timestamps = dataset.df.index[test_starts].astype(str).tolist()
+            #print(f"DEBUG: timestamps obtenidos, longitud {len(timestamps)}")
         except Exception:
             print(f"DEBUG: Error obteniendo timestamps: {e}")
             timestamps = []
-        print(f"DEBUG: Guardando en {output_path}")
+        #print(f"DEBUG: Guardando en {output_path}")
         # Guardar como .npz comprimido — eficiente para arrays grandes
+        # Extraer n_nodes y d para que experimentos3.py pueda reconstruir la estructura
+        _n_nodes = getattr(dataset, '_N', 1)
+        _d       = getattr(dataset, '_d', y_hat.shape[-1] // max(_n_nodes, 1))
+
         np.savez_compressed(
             output_path,
-            y_hat      = y_hat,
-            y_true     = y_true_np.reshape(y_true_np.shape[0], y_true_np.shape[1], -1),
-            mask       = dm.torch_dataset.eval_mask[dm.test_slice].reshape(
-                            mask_np.shape[0], mask_np.shape[1], -1),  # ← eval_mask, no mask
-            timestamps = np.array(timestamps, dtype=str),
+            y_hat         = y_hat,
+            y_true        = y_true_np.reshape(y_true_np.shape[0], y_true_np.shape[1], -1),
+            mask          = eval_mask_windows,
+            timestamps    = np.array(timestamps, dtype=str),
+            observed_mask = observed_windows,
+            n_nodes       = np.array([_n_nodes]),   # ← nuevo
+            d             = np.array([_d]),          # ← nuevo
         )
-        print("DEBUG: Guardado exitoso")
-        print(f'[Resultados guardados en: {output_path}.npz]')
-    else:
-        print("DEBUG: GRIN_OUTPUT_PATH no definido, no se guarda resultado")
+        #print("DEBUG: Guardado exitoso")
+        #print(f'[Resultados guardados en: {output_path}.npz]')
+    #else:
+        #print("DEBUG: GRIN_OUTPUT_PATH no definido, no se guarda resultado")
  
     return y_true, y_hat, mask
  

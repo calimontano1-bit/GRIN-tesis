@@ -3,7 +3,7 @@
 # Dos sensores (RBRL, RBMNN), 23 variables, frecuencia 30 min
 
 # Datos
-window: 8          # ventana de 8 pasos = 4 horas
+window: 48         # ventana de 48 pasos = 24 horas
 stride: 1
 
 # Entrenamiento
@@ -39,3 +39,5 @@ test_len: 0.2
 # Misc
 in_sample: false
 aggregate_by: mean
+
+horizon: 1

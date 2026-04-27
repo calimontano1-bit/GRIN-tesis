@@ -80,6 +80,9 @@ class StandardScaler(Scaler):
         else:
             self.bias = x.mean(axis=self.axis, keepdims=keepdims)
             self.scale = x.std(axis=self.axis, keepdims=keepdims)
+        self.bias = np.nan_to_num(self.bias, nan=0.0, posinf=0.0, neginf=0.0)
+        self.scale = np.nan_to_num(self.scale, nan=1.0, posinf=1.0, neginf=1.0)
+        self.scale = np.where(np.abs(self.scale) < 1e-8, 1.0, self.scale)
         return self
 
 
@@ -96,4 +99,7 @@ class MinMaxScaler(Scaler):
         else:
             self.bias = x.min(axis=self.axis, keepdims=keepdims)
             self.scale = (x.max(axis=self.axis, keepdims=keepdims) - self.bias)
+        self.bias = np.nan_to_num(self.bias, nan=0.0, posinf=0.0, neginf=0.0)
+        self.scale = np.nan_to_num(self.scale, nan=1.0, posinf=1.0, neginf=1.0)
+        self.scale = np.where(np.abs(self.scale) < 1e-8, 1.0, self.scale)
         return self

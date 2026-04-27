@@ -23,24 +23,26 @@ DISEÑO METODOLÓGICO (importante para reproducibilidad):
    y no introduce sesgos, ya que el missingness y la imputación son globales.
 
 Uso:
-    python experimentos3.py \
-        --dataset manglaria \
-        --config config/grin/manglaria.yaml \
-        --data-path manglaria_abril_timeseries.csv \
-        --output-dir resultados_manglaria \
-        --epochs 12 \
-        --corte-inicio "2022-04-15" \
-        --corte-fin "2022-04-30" \
-        --num-particiones 5
+     python experimentos3.py --dataset manglaria --config config/grin/manglaria.yaml \
+     --data-path manglaria_abril_timeseries.csv --output-dir resultados_manglaria --epochs 12 \
+     --corte-inicio "2022-04-01" --corte-fin "2022-04-30" --num-particiones 3 \
+     --solo-experimentos "mcar_1pct,mcar_3pct,mcar_5pct,mcar_10pct,mcar_15pct,mcar_30pct,mar_1pct, \
+     mar_3pct,mar_5pct,mar_10pct,mar_15pct,mar_30pct,mnar_1pct,mnar_3pct,mnar_5pct,mnar_10pct, \
+     mnar_15pct,mnar_30pct"
 
     python experimentos3.py \
-        --dataset mexflux \
-        --config config/grin/mexflux.yaml \
-        --data-path mexflux.csv \
-        --output-dir resultados_mexflux \
-        --epochs 12 \
-        --num-particiones 5 \
-        --particiones-a-evaluar "0,2,4"
+    --dataset mexflux \
+    --config config/grin/mexflux.yaml \
+    --data-path mexflux.csv \
+    --output-dir resultados_mexflux \
+    --epochs 12 \
+    --corte-inicio "2025-11-01" \
+    --corte-fin "2025-11-30" \
+    --num-particiones 5 \
+    --particiones-a-evaluar "0,2,4" \
+    --solo-experimentos "mcar_1pct,mcar_3pct,mcar_5pct,mcar_10pct, \
+    mcar_15pct,mcar_30pct,mar_1pct,mar_3pct,mar_5pct,mar_10pct,mar_15pct,mar_30pct, \
+    mnar_1pct,mnar_3pct,mnar_5pct,mnar_10pct,mnar_15pct,mnar_30pct" \
 
 Resultados en output-dir/:
     resultados.csv             — métricas globales por experimento
@@ -74,24 +76,21 @@ EXPERIMENTOS = [
     ("mcar_5pct",  "MCAR", 5.0,  0.000, 0.048, 4,  6,  "MCAR ~5%"),
     ("mcar_10pct", "MCAR", 10.0, 0.000, 0.098, 4,  6,  "MCAR ~10%"),
     ("mcar_15pct", "MCAR", 15.0, 0.000, 0.148, 4,  6,  "MCAR ~15%"),
-    ("mcar_8pct", "MCAR", 8.0, 0.000, 0.072, 4,  6,  "MCAR ~8%"),
-    ("mcar_20pct", "MCAR", 20.0, 0.000, 0.200, 4,  6,  "MCAR ~20%"),
+    ("mcar_30pct", "MCAR", 30.0, 0.000, 0.200, 4,  6,  "MCAR ~30%"),
     # MAR — mezcla de bloques cortos y puntuales
     ("mar_1pct",   "MAR",  1.0,  0.001, 0.003, 4,  6,  "MAR ~1%"),
     ("mar_3pct",   "MAR",  3.0,  0.004, 0.012, 4,  6,  "MAR ~3%"),
     ("mar_5pct",   "MAR",  5.0,  0.006, 0.020, 4,  6,  "MAR ~5%"),
     ("mar_10pct",  "MAR",  10.0, 0.012, 0.040, 4,  6,  "MAR ~10%"),
     ("mar_15pct",  "MAR",  15.0, 0.018, 0.060, 4,  6,  "MAR ~15%"),
-    ("mar_8pct",  "MAR",   8.0,  0.010, 0.080, 4,  6,  "MAR ~8%"),
-    ("mar_20pct",  "MAR",  20.0, 0.024, 0.080, 4,  6,  "MAR ~20%"),
+    ("mar_30pct",  "MAR",  30.0, 0.024, 0.080, 4,  6,  "MAR ~30%"),
     # MNAR — solo bloques largos, simula fallo de sensor
     ("mnar_1pct",  "MNAR", 1.0,  0.001, 0.000, 6,  12, "MNAR ~1%"),
     ("mnar_3pct",  "MNAR", 3.0,  0.003, 0.000, 6,  12, "MNAR ~3%"),
     ("mnar_5pct",  "MNAR", 5.0,  0.006, 0.000, 6,  12, "MNAR ~5%"),
     ("mnar_10pct", "MNAR", 10.0, 0.011, 0.000, 6,  12, "MNAR ~10%"),
     ("mnar_15pct", "MNAR", 15.0, 0.017, 0.000, 6,  12, "MNAR ~15%"),
-    ("mnar_8pct", "MNAR", 8.0, 0.007, 0.000, 6,  12, "MNAR ~8%"),
-    ("mnar_20pct", "MNAR", 20.0, 0.034, 0.000, 6,  12, "MNAR ~20%"),
+    ("mnar_30pct", "MNAR", 30.0, 0.034, 0.000, 6,  12, "MNAR ~30%"),
 ]
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -237,6 +236,63 @@ def generar_mascara(data_path, timestamp_col, p_block, p_point,
 
 # ── CÁLCULO DE MÉTRICAS ───────────────────────────────────────────────────────
 
+def generar_mascara_site_aware(data_path, timestamp_col, p_block, p_point,
+                               min_seq, max_seq, seed=42,
+                               corte_inicio=None, corte_fin=None):
+    df = pd.read_csv(data_path)
+    if 'site_id' not in df.columns or timestamp_col not in df.columns:
+        return generar_mascara(data_path, timestamp_col, p_block, p_point,
+                               min_seq, max_seq, seed=seed)
+
+    rng = np.random.RandomState(seed)
+    excluir = [timestamp_col, 'site_id', 'primary_key', 'DOY']
+    df_vars = df.drop(columns=[c for c in excluir if c in df.columns], errors='ignore')
+    var_cols = df_vars.select_dtypes(include=[np.number]).columns.tolist()
+
+    df['__ts'] = pd.to_datetime(df[timestamp_col], utc=True, errors='coerce')
+    df = df.dropna(subset=['__ts'])
+    if corte_inicio and corte_fin:
+        start_ts = pd.Timestamp(pd.to_datetime(corte_inicio, utc=True))
+        end_ts = pd.Timestamp(pd.to_datetime(corte_fin, utc=True))
+        if len(str(corte_fin)) <= 10:
+            end_ts = end_ts + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+        df = df[(df['__ts'] >= start_ts) & (df['__ts'] <= end_ts)]
+        if df.empty:
+            raise ValueError(f"El corte {start_ts}..{end_ts} no contiene datos en {data_path}")
+        print(f"  [DEBUG mascara] recorte temporal {start_ts} -> {end_ts}, filas={len(df)}")
+    sensores = sorted(df['site_id'].dropna().unique())
+    todos_timestamps = pd.DatetimeIndex(df['__ts']).unique().sort_values()
+
+    presentes = []
+    for sensor in sensores:
+        sub = df[df['site_id'] == sensor].sort_values('__ts')
+        sub = sub.drop_duplicates(subset=['__ts'], keep='last')
+        sub = sub.set_index('__ts')[var_cols]
+        presentes.append((~sub.reindex(todos_timestamps).isnull()).values)
+
+    presente = np.stack(presentes, axis=1)
+    mascara = np.zeros(presente.shape, dtype=bool)
+
+    for nodo in range(presente.shape[1]):
+        for var in range(presente.shape[2]):
+            t = 0
+            while t < presente.shape[0]:
+                if rng.random() < p_block:
+                    largo = rng.randint(min_seq, max_seq + 1)
+                    for dt in range(largo):
+                        if t + dt < presente.shape[0] and presente[t + dt, nodo, var]:
+                            mascara[t + dt, nodo, var] = True
+                    t += largo
+                else:
+                    if rng.random() < p_point and presente[t, nodo, var]:
+                        mascara[t, nodo, var] = True
+                    t += 1
+
+    print(f"  [DEBUG mascara] site-aware shape={mascara.shape}, "
+          f"timestamps={len(todos_timestamps)}, sitios={len(sensores)}, vars={len(var_cols)}")
+    return mascara
+
+
 def calcular_metricas(y_hat, y_true, mask):
     """
     Calcula MAE, RMSE, MSE, SMAPE sobre celdas donde mask=1.
@@ -251,6 +307,8 @@ def calcular_metricas(y_hat, y_true, mask):
         dict con métricas globales
     """
     m = mask.astype(bool)
+    finite = np.isfinite(y_hat) & np.isfinite(y_true)
+    m = m & finite
     if m.sum() == 0:
         return {'mae': np.nan, 'rmse': np.nan, 'mse': np.nan, 'smape': np.nan}
 
@@ -426,16 +484,23 @@ def calcular_metricas_corte_temporal(y_hat, y_true, mask, timestamps,
         ts = pd.to_datetime(timestamps, utc=True, errors='coerce')
         ci = pd.Timestamp(corte_inicio, tz='UTC')
         cf = pd.Timestamp(corte_fin,   tz='UTC')
+        if len(str(corte_fin)) <= 10:
+            cf = cf + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
     except Exception:
         try:
             ts = pd.to_datetime(timestamps, errors='coerce')
             ci = pd.Timestamp(corte_inicio)
             cf = pd.Timestamp(corte_fin)
+            if len(str(corte_fin)) <= 10:
+                cf = cf + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
         except Exception:
             return None
 
     idx = np.where((ts >= ci) & (ts <= cf))[0]
     if len(idx) == 0:
+        validos = ts[~pd.isnull(ts)]
+        if len(validos) > 0:
+            print(f"  [Corte] sin ventanas en {ci} -> {cf}; test cubre {validos.min()} -> {validos.max()}")
         return None
     if len(idx) > len(y_hat):
         idx = idx[:len(y_hat)]
@@ -451,7 +516,8 @@ def calcular_metricas_corte_temporal(y_hat, y_true, mask, timestamps,
 
 def correr_experimento(nombre, dataset, config, p_block, p_point,
                         min_seq, max_seq, epochs, workers,
-                        mask_path, output_npz, output_dir, log_file):
+                        mask_path, output_npz, output_dir, log_file,
+                        corte_inicio=None, corte_fin=None):
     """
     PASO 2 — IMPUTACIÓN GLOBAL.
 
@@ -477,6 +543,9 @@ def correr_experimento(nombre, dataset, config, p_block, p_point,
     env['GRIN_MASK_PATH']   = mask_path
     # VERIFICACIÓN 2: el npz contendrá la serie completa del test set
     env['GRIN_OUTPUT_PATH'] = output_npz
+    if corte_inicio and corte_fin:
+        env['GRIN_CORTE_INICIO'] = corte_inicio
+        env['GRIN_CORTE_FIN'] = corte_fin
 
     cmd = [
         sys.executable, '-m', 'scripts.run_imputation2',
@@ -497,7 +566,7 @@ def correr_experimento(nombre, dataset, config, p_block, p_point,
 
     output_lines = []
     for line in process.stdout:
-        print(line, end='')          # Muestra los DEBUG en vivo
+        #print(line, end='')          # Muestra los DEBUG en vivo
         output_lines.append(line)
 
     process.wait()                   # Espera a que termine
@@ -527,12 +596,24 @@ def cargar_npz(path):
         'y_true':     data['y_true'],
         'mask':       data['mask'],
         'timestamps': data['timestamps'].tolist() if 'timestamps' in data else [],
+        'observed_mask': data['observed_mask'] if 'observed_mask' in data else None,
+        'site_names': data['site_names'].tolist() if 'site_names' in data else [],
+        'n_nodes':    int(np.squeeze(data['n_nodes'])) if 'n_nodes' in data else None,
+        'd':          int(np.squeeze(data['d']))        if 'd'       in data else None,
     }
     # Log de verificación
     B, W, F = resultado['y_hat'].shape
     print(f"  [✓ NPZ cargado] y_hat={resultado['y_hat'].shape}  "
           f"timestamps={len(resultado['timestamps'])} entradas")
     print(f"    → Serie completa del test: {B} ventanas × {W} pasos × {F} features")
+    if resultado['timestamps']:
+        ts = pd.to_datetime(resultado['timestamps'], utc=True, errors='coerce')
+        if (~pd.isnull(ts)).sum() > 0:
+            print(f"    -> timestamps test: {ts.min()} -> {ts.max()}")
+    print(f"    -> mask: shape={resultado['mask'].shape}, true={int(resultado['mask'].sum())}, "
+          f"density={resultado['mask'].mean():.4%}")
+    print(f"    -> finite: y_hat={np.isfinite(resultado['y_hat']).mean():.4%}, "
+          f"y_true={np.isfinite(resultado['y_true']).mean():.4%}")
     return resultado
 
 
@@ -707,6 +788,24 @@ def verificar_adaptador():
     return False
 
 
+def imprimir_tabla_particiones(metricas_particiones, nombre, patron, pct_obj):
+    """Imprime una tabla con las métricas por partición para un experimento."""
+    if not metricas_particiones:
+        return
+    print(f"\n  Particiones para {nombre} ({patron} ~{pct_obj:.0f}%):")
+    print(f"  {'Partición':<10} {'Inicio':<12} {'Fin':<12} {'MAE':>8} {'RMSE':>8} {'MSE':>8} {'SMAPE%':>8} {'Missing':>9} {'N puntos':>9}")
+    print(f"  {'-'*95}")
+    for p in metricas_particiones:
+        if p['n_ventanas'] == 0:
+            continue
+        # Extraer solo la fecha (sin hora) si es necesario
+        inicio = p['inicio'].split()[0] if ' ' in p['inicio'] else p['inicio']
+        fin = p['fin'].split()[0] if ' ' in p['fin'] else p['fin']
+        print(f"  P{p['particion']:<9} {inicio:<12} {fin:<12} "
+              f"{p['mae']:>8.4f} {p['rmse']:>8.4f} {p['mse']:>8.4f} "
+              f"{p['smape']:>7.2f}% {p['densidad_missing']:>8.2%} {p['n_puntos_evaluados']:>9,}")
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -761,7 +860,8 @@ def main():
     else:
         n_nodos = 1
 
-    print(f"\nNodos detectados: {n_nodos}  |  Variables por nodo: {n_vars // n_nodos}")
+    vars_por_nodo = n_vars if 'site_id' in df_tmp.columns else n_vars // n_nodos
+    print(f"\nNodos detectados: {n_nodos}  |  Variables por nodo: {vars_por_nodo}")
     print(f"Missingness original: {pct_real:.2f}%")
 
     todos_resultados = []
@@ -783,10 +883,12 @@ def main():
         # La máscara se genera UNA SOLA VEZ aquí.
         # No existe ninguna otra llamada a generar_mascara en este experimento.
         print(f"  [Paso 1] Generando máscara global...")
-        mascara = generar_mascara(
+        mascara = generar_mascara_site_aware(
             args.data_path, ts_col,
             p_block, p_point, min_seq, max_seq,
-            seed=hash(nombre) % 2**31
+            seed=hash(nombre) % 2**31,
+            corte_inicio=args.corte_inicio,
+            corte_fin=args.corte_fin
         )
         pct_artificial = mascara.mean() * 100
         mask_path = f"{args.output_dir}/mask_{nombre}.npy"
@@ -804,7 +906,8 @@ def main():
             p_block, p_point, min_seq, max_seq,
             args.epochs, args.workers,
             mask_path, output_npz,
-            args.output_dir, log_file
+            args.output_dir, log_file,
+            args.corte_inicio, args.corte_fin
         )
 
         # Cargar resultados — verificación de que el npz es completo
@@ -821,6 +924,10 @@ def main():
             yt  = datos['y_true']
             mk  = datos['mask']
             tss = datos['timestamps']
+            observed_mask = datos.get('observed_mask')
+            site_names = datos.get('site_names', [])
+            n_nodes_npz = int(np.squeeze(datos.get('n_nodes', n_nodos)))
+            d_npz       = int(np.squeeze(datos.get('d', yh.shape[-1] // max(n_nodes_npz, 1))))
 
             # ── PASO 3: EVALUACIÓN LOCAL ──────────────────────────────────
             # Todas las métricas se calculan filtrando sobre los arrays globales.
@@ -846,14 +953,7 @@ def main():
                 num_particiones=args.num_particiones,
                 particiones_a_evaluar=particiones_evaluar
             )
-            for p in metricas_particiones:
-                if p['n_ventanas'] > 0:
-                    print(f"    [P{p['particion']}] {p['inicio']}→{p['fin']}: "
-                          f"MAE={p['mae']:.4f}  "
-                          f"missing={p['densidad_missing']:.2%}  "
-                          f"n={p['n_puntos_evaluados']}")
-                else:
-                    print(f"    [P{p['particion']}] {p['inicio']}→{p['fin']}: sin datos")
+            imprimir_tabla_particiones(metricas_particiones, nombre, patron, pct_obj)
 
             # Métricas en corte temporal fijo (opcional)
             metricas_corte = calcular_metricas_corte_temporal(
@@ -871,13 +971,17 @@ def main():
             args.viz_patron, args.viz_pct
         ):
             plot_imputations_grid(
-                data_true     = yh,         # usar yh (y_hat) vs yt (y_true)
-                data_imputed  = yt,
+                data_true     = yt,
+                data_imputed  = yh,
                 mask          = mk,
                 feature_names = VAR_NAMES,
                 exp_name      = nombre,
                 output_dir    = args.output_dir,
                 timestamps    = tss,
+                observed_mask = None,
+                site_names    = site_names,
+                n_nodes       = n_nodes_npz,
+                d             = d_npz,
             )
 
         todos_resultados.append({
@@ -906,7 +1010,6 @@ def main():
     print(f"  Particiones:   {args.output_dir}/resultados_particiones.csv")
     print(f"  Datos origen:  {args.output_dir}/resumen_datos.txt")
     print(f"  Log:           {args.output_dir}/log_experimentos.txt")
-
 
 if __name__ == '__main__':
     main()

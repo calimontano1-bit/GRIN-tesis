@@ -1,72 +1,74 @@
 """
 visualizar_imputaciones.py
 ==========================
-Módulo de visualización de imputaciones GRIN para ManglarIA.
-
-Genera un grid de subgráficas (small multiples) mostrando:
-  - Serie original (ground truth)
-  - Serie imputada
-  - Puntos imputados resaltados
-
-Uso dentro del loop de experimentos:
-    from visualizar_imputaciones import plot_imputations_grid
-
-    # Después de cargar el .npz:
-    datos = cargar_npz(output_npz)
-    if datos is not None:
-        plot_imputations_grid(
-            data_true     = datos['y_true'],
-            data_imputed  = datos['y_hat'],
-            mask          = datos['mask'],
-            feature_names = VAR_NAMES,      # lista de nombres de variables
-            exp_name      = nombre,
-            output_dir    = args.output_dir,
-        )
-
-Para filtrar por patrón y porcentaje al correr:
-    python experimentos.py ... --viz-patron MCAR --viz-pct 5
-
+Modulo de visualizacion de imputaciones GRIN.
 """
 
 import os
 import argparse
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')   # sin pantalla, genera archivos directamente
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 
 
-# ── PALETA VISUAL ─────────────────────────────────────────────────────────────
-COLOR_ORIGINAL = '#2C3E50'    # azul oscuro — serie original
-COLOR_IMPUTED  = '#95A5A6'    # gris claro  — serie imputada (fondo)
-COLOR_POINTS   = '#E74C3C'    # rojo        — puntos imputados resaltados
-ALPHA_ORIG     = 0.85
-ALPHA_IMP      = 0.55
-MARKER_SIZE    = 4
+COLOR_ORIGINAL = '#2C3E50'
+COLOR_IMPUTED = '#95A5A6'
+COLOR_POINTS = '#E74C3C'
+ALPHA_ORIG = 0.85
+ALPHA_IMP = 0.55
+MARKER_SIZE = 4
 
 
 def _reconstruir_serie(data, timestamps=None):
     """
     Reconstruye una serie temporal (T, features) a partir de
-    ventanas (B, W, features) tomando el último paso de cada ventana.
-
-    Esto evita duplicar datos de solapamiento entre ventanas contiguas.
-
-    Retorna:
-        serie:      (T_reconstruida, features)
-        ts_serie:   lista de timestamps si se proporcionan, sino None
+    ventanas (B, W, features) tomando el ultimo paso de cada ventana.
     """
-    B, W, F = data.shape
-    # Tomamos solo el último paso de cada ventana → T_reconstruida ≈ B
-    serie = data[:, -1, :]   # (B, F) — sin copiar la dimensión W completa
-    if timestamps is not None and len(timestamps) == B:
+    b, _, _ = data.shape
+    serie = data[:, -1, :]
+    if timestamps is not None and len(timestamps) == b:
         return serie, list(timestamps)
     return serie, None
 
 
-def plot_imputations_grid(
+def _expandir_feature_names(feature_names, n_features, n_nodes=1, d=None, site_names=None):
+    if feature_names is None:
+        return [f'f_{i}' for i in range(n_features)]
+    if len(feature_names) == n_features:
+        return list(feature_names)
+    if d is None and n_nodes > 0 and n_features % n_nodes == 0:
+        d = n_features // n_nodes
+    if d is not None and len(feature_names) == d and n_nodes > 1:
+        if site_names is None or len(site_names) != n_nodes:
+            site_names = [f'node_{i}' for i in range(n_nodes)]
+        expanded = []
+        for site in site_names:
+            expanded.extend([f"{site}::{name}" for name in feature_names])
+        if len(expanded) == n_features:
+            return expanded
+    return [f'f_{i}' for i in range(n_features)]
+
+
+def _sombrear_zonas(ax, x, mask_bool):
+    in_block = False
+    start = 0
+    for i, val in enumerate(mask_bool):
+        if val and not in_block:
+            start = x[i]
+            in_block = True
+        elif not val and in_block:
+            ax.axvspan(start - 0.5, x[i - 1] + 0.5,
+                       color=COLOR_POINTS, alpha=0.08, zorder=0)
+            in_block = False
+    if in_block:
+        ax.axvspan(start - 0.5, x[-1] + 0.5,
+                   color=COLOR_POINTS, alpha=0.08, zorder=0)
+
+
+def _plot_single_grid(
     data_true,
     data_imputed,
     mask,
@@ -74,44 +76,27 @@ def plot_imputations_grid(
     exp_name,
     output_dir='.',
     timestamps=None,
+    observed_mask=None,
     n_cols=6,
     figsize=(20, 14),
+    y_percentile_clip=(1, 99),
+    filename_suffix='',
 ):
-    """
-    Genera un grid de subgráficas mostrando la imputación de cada variable.
+    true_series, _ = _reconstruir_serie(data_true, timestamps)
+    imputed_series, _ = _reconstruir_serie(data_imputed, timestamps)
+    mask_series, _ = _reconstruir_serie(mask, timestamps)
+    observed_series = None
+    if observed_mask is not None:
+        observed_series, _ = _reconstruir_serie(observed_mask, timestamps)
 
-    Parámetros:
-        data_true    — array (B, W, features) con valores reales
-        data_imputed — array (B, W, features) con predicciones del modelo
-        mask         — array (B, W, features) con 1 donde hay hueco imputado
-        feature_names — lista de strings con nombre de cada variable
-        exp_name     — string con nombre del experimento (título de figura)
-        output_dir   — directorio donde guardar la imagen
-        timestamps   — lista opcional de strings con fechas del eje X
-        n_cols       — número de columnas del grid (default: 6)
-        figsize      — tamaño de figura en pulgadas
-
-    Guarda:
-        {output_dir}/viz_{exp_name}.png
-    """
-    # Reconstruir series temporales desde ventanas
-    true_series,   ts = _reconstruir_serie(data_true,     timestamps)
-    imputed_series, _  = _reconstruir_serie(data_imputed,  timestamps)
-    mask_series,    _  = _reconstruir_serie(mask,          timestamps)
-
-    T, n_features = true_series.shape
-
-    # Ajustar número de variables al mínimo entre array y lista de nombres
+    t, n_features = true_series.shape
     n_vars = min(n_features, len(feature_names))
     n_rows = int(np.ceil(n_vars / n_cols))
+    x = np.arange(t)
 
-    # Eje X
-    x = np.arange(T)
-
-    # ── FIGURA ────────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=figsize, facecolor='#FAFAFA')
     fig.suptitle(
-        f'Imputaciones GRIN — {exp_name}',
+        f'Imputaciones GRIN - {exp_name}{filename_suffix}',
         fontsize=13, fontweight='bold', color='#2C3E50',
         y=0.98
     )
@@ -122,37 +107,46 @@ def plot_imputations_grid(
         hspace=0.55,
         wspace=0.35,
         left=0.04, right=0.97,
-        top=0.93,  bottom=0.06
+        top=0.93, bottom=0.06
     )
 
     for v in range(n_vars):
         row = v // n_cols
         col = v % n_cols
-        ax  = fig.add_subplot(gs[row, col])
+        ax = fig.add_subplot(gs[row, col])
 
-        y_true = true_series[:, v]
-        y_hat  = imputed_series[:, v]
-        m      = mask_series[:, v].astype(bool)
+        y_true = true_series[:, v].copy()
+        y_hat = imputed_series[:, v].copy()
+        m = mask_series[:, v].astype(bool)
 
-        # Serie imputada de fondo (completa)
-        ax.plot(x, y_hat,
-                color=COLOR_IMPUTED, linewidth=0.8,
-                alpha=ALPHA_IMP, zorder=1, label='_nolegend_')
+        if observed_series is not None:
+            observed = observed_series[:, v].astype(bool)
+            y_true_plot = y_true.copy()
+            y_true_plot[~observed] = np.nan
+        else:
+            y_true_plot = y_true
 
-        # Serie original encima
-        ax.plot(x, y_true,
+        ax.plot(x, y_true_plot,
                 color=COLOR_ORIGINAL, linewidth=0.9,
                 alpha=ALPHA_ORIG, zorder=2, label='_nolegend_')
 
-        # Puntos imputados resaltados
         if m.sum() > 0:
             ax.scatter(
                 x[m], y_hat[m],
-                color=COLOR_POINTS, s=MARKER_SIZE**2,
+                color=COLOR_POINTS, s=MARKER_SIZE ** 2,
                 zorder=3, linewidths=0, label='_nolegend_'
             )
 
-        # Estética del subplot
+        vals = np.concatenate([
+            y_true_plot[np.isfinite(y_true_plot)],
+            y_hat[np.isfinite(y_hat)]
+        ])
+        if vals.size > 0:
+            lo, hi = np.percentile(vals, y_percentile_clip)
+            if np.isfinite(lo) and np.isfinite(hi) and lo < hi:
+                pad = 0.05 * (hi - lo)
+                ax.set_ylim(lo - pad, hi + pad)
+
         ax.set_title(feature_names[v], fontsize=7, pad=3,
                      color='#34495E', fontweight='semibold')
         ax.tick_params(axis='both', labelsize=5, length=2)
@@ -162,21 +156,16 @@ def plot_imputations_grid(
         ax.spines['bottom'].set_color('#BDC3C7')
         ax.set_facecolor('#F8F9FA')
 
-        # Sombrear zonas imputadas
         if m.sum() > 0:
             _sombrear_zonas(ax, x, m)
 
-    # Ocultar subplots vacíos
     for v in range(n_vars, n_rows * n_cols):
         row = v // n_cols
         col = v % n_cols
         fig.add_subplot(gs[row, col]).set_visible(False)
 
-    # Leyenda global
     legend_elements = [
-        Line2D([0], [0], color=COLOR_ORIGINAL, linewidth=1.5, label='Original'),
-        Line2D([0], [0], color=COLOR_IMPUTED,  linewidth=1.5,
-               alpha=0.7, label='Imputado'),
+        Line2D([0], [0], color=COLOR_ORIGINAL, linewidth=1.5, label='Original observado'),
         Line2D([0], [0], marker='o', color='w',
                markerfacecolor=COLOR_POINTS, markersize=5, label='Punto imputado'),
     ]
@@ -191,50 +180,107 @@ def plot_imputations_grid(
         bbox_to_anchor=(0.5, 0.01)
     )
 
-    # Guardar
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f'viz_{exp_name}.png')
+    out_path = os.path.join(output_dir, f"viz_{exp_name}{filename_suffix}.png")
     fig.savefig(out_path, dpi=130, bbox_inches='tight', facecolor='#FAFAFA')
     plt.close(fig)
-    print(f"  [✓ Visualización] {out_path}")
+    print(f"  [OK Visualizacion] {out_path}")
     return out_path
 
 
-def _sombrear_zonas(ax, x, mask_bool):
-    """
-    Sombrea con color suave las zonas donde hay huecos imputados.
-    Agrupa posiciones contiguas en bloques para eficiencia.
-    """
-    ymin, ymax = ax.get_ylim()
-    in_block = False
-    start    = 0
-    for i, val in enumerate(mask_bool):
-        if val and not in_block:
-            start    = x[i]
-            in_block = True
-        elif not val and in_block:
-            ax.axvspan(start - 0.5, x[i - 1] + 0.5,
-                       color=COLOR_POINTS, alpha=0.08, zorder=0)
-            in_block = False
-    if in_block:
-        ax.axvspan(start - 0.5, x[-1] + 0.5,
-                   color=COLOR_POINTS, alpha=0.08, zorder=0)
+def plot_imputations_grid(
+    data_true,
+    data_imputed,
+    mask,
+    feature_names,
+    exp_name,
+    output_dir='.',
+    timestamps=None,
+    observed_mask=None,
+    site_names=None,
+    n_nodes=1,
+    d=None,
+    n_cols=6,
+    figsize=(20, 14),
+    y_percentile_clip=(1, 99),
+):
+    n_features = data_true.shape[-1]
 
+    if n_nodes is None or n_nodes < 1:
+        n_nodes = 1
+    if d is None and n_nodes > 0 and n_features % n_nodes == 0:
+        d = n_features // n_nodes
+    if d is None:
+        d = n_features
+    
+    feature_names = _expandir_feature_names(
+        feature_names,
+        n_features,
+        n_nodes=n_nodes,
+        d=d,
+        site_names=site_names
+    )
 
-# ── INTEGRACIÓN CON experimentos.py ──────────────────────────────────────────
+    # ─── CASO ESPECIAL: muchos nodos con 1 sola variable ───
+    # Ejemplo: ManglarIA (27 nodos × 1 variable)
+    # Queremos una sola cuadrícula, no una imagen por variable.
+    if d == 1 and n_nodes > 1:
+        return _plot_single_grid(
+            data_true=data_true,
+            data_imputed=data_imputed,
+            mask=mask,
+            feature_names=feature_names[:n_features],
+            exp_name=exp_name,
+            output_dir=output_dir,
+            timestamps=timestamps,
+            observed_mask=observed_mask,
+            n_cols=n_cols,
+            figsize=figsize,
+            y_percentile_clip=y_percentile_clip,
+            filename_suffix='',          # una sola imagen sin sufijo de nodo
+        )
+
+    outputs = []
+    if n_nodes > 1 and d * n_nodes <= n_features:
+        if site_names is None or len(site_names) != n_nodes:
+            site_names = [f'node_{i}' for i in range(n_nodes)]
+        for node_idx, site_name in enumerate(site_names):
+            start = node_idx * d
+            end = start + d
+            node_observed = observed_mask[:, :, start:end] if observed_mask is not None else None
+            node_feature_names = [name.split('::', 1)[-1] for name in feature_names[start:end]]
+            outputs.append(_plot_single_grid(
+                data_true=data_true[:, :, start:end],
+                data_imputed=data_imputed[:, :, start:end],
+                mask=mask[:, :, start:end],
+                feature_names=node_feature_names,
+                exp_name=exp_name,
+                output_dir=output_dir,
+                timestamps=timestamps,
+                observed_mask=node_observed,
+                n_cols=n_cols,
+                figsize=figsize,
+                y_percentile_clip=y_percentile_clip,
+                filename_suffix=f'_{site_name}',
+            ))
+        return outputs
+
+    return _plot_single_grid(
+        data_true=data_true,
+        data_imputed=data_imputed,
+        mask=mask,
+        feature_names=feature_names[:n_features],
+        exp_name=exp_name,
+        output_dir=output_dir,
+        timestamps=timestamps,
+        observed_mask=observed_mask,
+        n_cols=n_cols,
+        figsize=figsize,
+        y_percentile_clip=y_percentile_clip,
+    )
+
 
 def args_visualizacion(parser):
-    """
-    Agrega argumentos CLI de visualización a un ArgumentParser existente.
-
-    Uso en experimentos.py:
-        from visualizar_imputaciones import args_visualizacion
-        parser = args_visualizacion(parser)   # dentro de parse_args()
-
-    Argumentos añadidos:
-        --viz-patron   patrón a visualizar (MCAR, MAR, MNAR, o 'todos')
-        --viz-pct      porcentaje a visualizar (1, 3, 5, 10, 15, o 0 = todos)
-    """
     parser.add_argument(
         '--viz-patron', type=str, default='todos',
         help="Patrón de missingness a visualizar: MCAR, MAR, MNAR, o 'todos' (default)"
@@ -247,19 +293,6 @@ def args_visualizacion(parser):
 
 
 def debe_visualizar(nombre, patron, pct_objetivo, viz_patron, viz_pct):
-    """
-    Decide si este experimento debe generar visualización.
-
-    Parámetros:
-        nombre       — ej. 'mcar_5pct'
-        patron       — ej. 'MCAR'
-        pct_objetivo — ej. 5.0
-        viz_patron   — argumento --viz-patron del CLI
-        viz_pct      — argumento --viz-pct del CLI (0 = todos)
-
-    Retorna:
-        True si debe visualizarse, False si no
-    """
     if viz_patron.lower() != 'todos':
         if patron.upper() != viz_patron.upper():
             return False

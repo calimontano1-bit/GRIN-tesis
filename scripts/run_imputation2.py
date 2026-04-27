@@ -32,6 +32,76 @@ def has_graph_support(model_cls):
     return model_cls in [models.GRINet]
 
 
+def _get_env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value == '':
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def configure_runtime(args):
+    logical_cores = os.cpu_count() or 1
+    recommended_threads = min(logical_cores, 8)
+    recommended_interop = 1
+    recommended_workers = min(4, max(2, logical_cores // 2))
+
+    has_xpu = hasattr(torch, 'xpu')
+    xpu_available = False
+    if has_xpu:
+        try:
+            xpu_available = torch.xpu.is_available()
+        except Exception:
+            xpu_available = False
+
+    cuda_available = torch.cuda.is_available()
+
+    if xpu_available and not cuda_available:
+        print(
+            "INFO: Se detecto soporte XPU en torch, pero PyTorch Lightning 1.4 "
+            "solo usa Trainer(gpus=...) para CUDA. Se usara CPU en este entorno."
+        )
+
+    cpu_threads = max(1, _get_env_int('GRIN_NUM_THREADS', recommended_threads))
+    interop_threads = max(1, _get_env_int('GRIN_INTEROP_THREADS', recommended_interop))
+
+    # Configure PyTorch CPU threading before any heavy eager/autograd work.
+    torch.set_num_threads(cpu_threads)
+    if hasattr(torch, 'set_num_interop_threads'):
+        try:
+            torch.set_num_interop_threads(interop_threads)
+        except RuntimeError:
+            pass
+
+    if hasattr(torch.backends, 'mkldnn'):
+        torch.backends.mkldnn.enabled = True
+
+    trainer_kwargs = {'gpus': 1} if cuda_available else {'gpus': None}
+    runtime_device = torch.device('cuda:0' if cuda_available else 'cpu')
+
+    print(
+        "INFO: runtime="
+        f"{runtime_device.type}, torch_threads={torch.get_num_threads()}, "
+        f"interop_threads={getattr(torch, 'get_num_interop_threads', lambda: 'n/a')()}"
+    )
+    if getattr(args, 'workers', None) is not None and args.workers > recommended_workers:
+        print(
+            f"INFO: workers={args.workers}. En Windows y con este tamano de dataset "
+            f"suele rendir mejor workers={recommended_workers}."
+        )
+
+    return {
+        'device': runtime_device,
+        'trainer_kwargs': trainer_kwargs,
+        'recommended_threads': recommended_threads,
+        'recommended_workers': recommended_workers,
+        'xpu_available': xpu_available,
+        'cuda_available': cuda_available,
+    }
+
+
 def window_time_array(values, starts, window, name='array'):
     values = values.detach().cpu().numpy() if isinstance(values, torch.Tensor) else np.asarray(values)
     starts = np.asarray(starts, dtype=int)
@@ -496,7 +566,7 @@ def run_experiment(args):
     args = copy.deepcopy(args)
     if args.seed < 0:
         args.seed = np.random.randint(1e9)
-    torch.set_num_threads(1)
+    runtime = configure_runtime(args)
     pl.seed_everything(args.seed)
 
     # === DEBUG: Verificar máscara externa ===
@@ -619,10 +689,10 @@ def run_experiment(args):
     trainer = pl.Trainer(max_epochs=args.epochs,
                          logger=logger,
                          default_root_dir=logdir,
-                         gpus=1 if torch.cuda.is_available() else None,
                          gradient_clip_val=args.grad_clip_val,
                          gradient_clip_algorithm=args.grad_clip_algorithm,
-                         callbacks=[early_stop_callback, checkpoint_callback])
+                         callbacks=[early_stop_callback, checkpoint_callback],
+                         **runtime['trainer_kwargs'])
 
     #print("DEBUG: Iniciando entrenamiento...")
     trainer.fit(filler, datamodule=dm)
@@ -640,8 +710,8 @@ def run_experiment(args):
     #print("DEBUG: trainer.test completado")
     filler.eval()
 
-    if torch.cuda.is_available():
-        filler.cuda()
+    if runtime['device'].type == 'cuda':
+        filler.to(runtime['device'])
     
     #print("DEBUG: Ejecutando predict_loader...")
     with torch.no_grad():

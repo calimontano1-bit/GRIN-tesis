@@ -3,8 +3,7 @@ from copy import deepcopy
 
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.core.decorators import auto_move_data
-from pytorch_lightning.metrics import MetricCollection
+from torchmetrics import MetricCollection
 from pytorch_lightning.utilities import move_data_to_device
 
 from .. import epsilon
@@ -74,7 +73,6 @@ class Filler(pl.LightningModule):
     def trainable_parameters(self):
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
-    @auto_move_data
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 

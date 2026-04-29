@@ -22,6 +22,9 @@ class SpatioTemporalDataModule(pl.LightningDataModule):
                  test_idxs=None,
                  batch_size=32,
                  workers=1,
+                 pin_memory=False,
+                 persistent_workers=False,
+                 prefetch_factor=2,
                  samples_per_epoch=None):
         super(SpatioTemporalDataModule, self).__init__()
         self.torch_dataset = dataset
@@ -37,7 +40,17 @@ class SpatioTemporalDataModule(pl.LightningDataModule):
         # data loaders
         self.batch_size = batch_size
         self.workers = workers
+        self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         self.samples_per_epoch = samples_per_epoch
+        # escaladores d_in
+        self.train_covariate_scaler = None
+        self.val_covariate_scaler   = None
+        self.test_covariate_scaler  = None
+        self.train_target_scaler    = None
+        self.val_target_scaler      = None
+        self.test_target_scaler     = None
 
     @property
     def is_spatial(self):
@@ -45,14 +58,10 @@ class SpatioTemporalDataModule(pl.LightningDataModule):
 
     @property
     def n_nodes(self):
-        if not self.has_setup_fit:
-            raise ValueError('You should initialize the datamodule first.')
-        return self.torch_dataset.n_nodes if self.is_spatial else None
+        return self.torch_dataset.n_nodes
 
     @property
     def d_in(self):
-        if not self.has_setup_fit:
-            raise ValueError('You should initialize the datamodule first.')
         return self.torch_dataset.n_channels
 
     @property
@@ -116,11 +125,18 @@ class SpatioTemporalDataModule(pl.LightningDataModule):
 
     def _data_loader(self, dataset, shuffle=False, batch_size=None, **kwargs):
         batch_size = self.batch_size if batch_size is None else batch_size
+        loader_kwargs = dict(
+            shuffle=shuffle,
+            batch_size=batch_size,
+            num_workers=self.workers,
+            pin_memory=self.pin_memory,
+        )
+        if self.workers > 0:
+            loader_kwargs['persistent_workers'] = self.persistent_workers
+            loader_kwargs['prefetch_factor'] = self.prefetch_factor
+        loader_kwargs.update(kwargs)
         return DataLoader(dataset,
-                          shuffle=shuffle,
-                          batch_size=batch_size,
-                          num_workers=self.workers,
-                          **kwargs)
+                          **loader_kwargs)
 
     def train_dataloader(self, shuffle=True, batch_size=None):
         if self.samples_per_epoch is not None:
@@ -141,5 +157,8 @@ class SpatioTemporalDataModule(pl.LightningDataModule):
         parser.add_argument('--scaling-type', type=str, default="std")
         parser.add_argument('--scale', type=str_to_bool, nargs='?', const=True, default=True)
         parser.add_argument('--workers', type=int, default=0)
+        parser.add_argument('--pin-memory', type=str_to_bool, nargs='?', const=True, default=False)
+        parser.add_argument('--persistent-workers', type=str_to_bool, nargs='?', const=True, default=False)
+        parser.add_argument('--prefetch-factor', type=int, default=2)
         parser.add_argument('--samples-per-epoch', type=int, default=None)
         return parser

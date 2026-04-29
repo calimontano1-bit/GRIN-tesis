@@ -4,14 +4,19 @@ run_imputation2.py
 
 import copy
 import datetime
+import inspect
 import os
 import pathlib
 from argparse import ArgumentParser
 
 import pandas as pd
 import numpy as np
-import pytorch_lightning as pl
 import torch
+try:
+    import intel_extension_for_pytorch as ipex
+except ImportError:
+    ipex = None
+import pytorch_lightning as pl
 import torch.nn.functional as F
 import yaml
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -26,7 +31,17 @@ from lib.nn.utils.metric_base import MaskedMetric
 from lib.nn.utils.metrics import MaskedMAE, MaskedMAPE, MaskedMSE, MaskedMRE
 from lib.utils import parser_utils, numpy_metrics, ensure_list, prediction_dataframe
 from lib.utils.parser_utils import str_to_bool
-
+# Permitir carga segura en producción (solo si se solicita)
+if os.environ.get('GRIN_SECURE_LOAD', 'true').lower() in ('1', 'true', 'yes'):
+    # Lista de objetos NumPy que aparecen en nuestros checkpoints
+    torch.serialization.add_safe_globals([
+        np.ndarray,
+        np.dtype,
+        np._core.multiarray._reconstruct  # ruta moderna sin deprecation
+    ])
+    SECURE_LOAD = True
+else:
+    SECURE_LOAD = False
 
 def has_graph_support(model_cls):
     return model_cls in [models.GRINet]
@@ -42,11 +57,22 @@ def _get_env_int(name, default):
         return default
 
 
+def _get_env_flag(name, default):
+    value = os.environ.get(name)
+    if value is None or value == '':
+        return default
+    return value.lower() in {'1', 'true', 'yes', 'on'}
+
+
 def configure_runtime(args):
     logical_cores = os.cpu_count() or 1
     recommended_threads = min(logical_cores, 8)
     recommended_interop = 1
     recommended_workers = min(4, max(2, logical_cores // 2))
+    lightning_major = int(str(pl.__version__).split('.', 1)[0])
+
+    requested_device = getattr(args, 'device_preference', 'auto')
+    requested_device = requested_device.lower()
 
     has_xpu = hasattr(torch, 'xpu')
     xpu_available = False
@@ -57,15 +83,21 @@ def configure_runtime(args):
             xpu_available = False
 
     cuda_available = torch.cuda.is_available()
+    supports_xpu_in_trainer = False
+    supports_accelerator_kw = 'accelerator' in inspect.signature(pl.Trainer.__init__).parameters
 
-    if xpu_available and not cuda_available:
-        print(
-            "INFO: Se detecto soporte XPU en torch, pero PyTorch Lightning 1.4 "
-            "solo usa Trainer(gpus=...) para CUDA. Se usara CPU en este entorno."
-        )
+    if requested_device == 'cuda' and not cuda_available:
+        print('INFO: Se solicito CUDA pero no esta disponible. Se evaluaran otras opciones.')
+    if requested_device == 'xpu' and not xpu_available:
+        print('INFO: Se solicito XPU pero torch.xpu no esta disponible. Se evaluaran otras opciones.')
 
     cpu_threads = max(1, _get_env_int('GRIN_NUM_THREADS', recommended_threads))
     interop_threads = max(1, _get_env_int('GRIN_INTEROP_THREADS', recommended_interop))
+    use_ipex = getattr(args, 'use_ipex', True) and ipex is not None
+    use_torch_compile = getattr(args, 'torch_compile', False) and hasattr(torch, 'compile')
+    matmul_precision = getattr(args, 'matmul_precision', 'highest')
+    pin_memory = getattr(args, 'pin_memory', False)
+    persistent_workers = getattr(args, 'persistent_workers', False)
 
     # Configure PyTorch CPU threading before any heavy eager/autograd work.
     torch.set_num_threads(cpu_threads)
@@ -78,13 +110,54 @@ def configure_runtime(args):
     if hasattr(torch.backends, 'mkldnn'):
         torch.backends.mkldnn.enabled = True
 
-    trainer_kwargs = {'gpus': 1} if cuda_available else {'gpus': None}
-    runtime_device = torch.device('cuda:0' if cuda_available else 'cpu')
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        try:
+            torch.set_float32_matmul_precision(matmul_precision)
+        except Exception:
+            pass
+
+    runtime_device = torch.device('cpu')
+    trainer_kwargs = {}
+    selected_backend = 'cpu'
+    if requested_device in ('auto', 'cuda') and cuda_available:
+        runtime_device = torch.device('cuda:0')
+        selected_backend = 'cuda'
+    elif requested_device in ('auto', 'xpu') and xpu_available and supports_xpu_in_trainer:
+        runtime_device = torch.device('xpu:0')
+        selected_backend = 'xpu'
+    elif requested_device == 'cpu':
+        runtime_device = torch.device('cpu')
+        selected_backend = 'cpu'
+    elif requested_device == 'xpu' and xpu_available:
+        print(
+            f"INFO: torch.xpu esta disponible, pero Lightning {pl.__version__} no trae "
+            "soporte XPU listo para usar en Trainer. Esta rama seguira en CPU para entrenamiento."
+        )
+
+    if supports_accelerator_kw:
+        if selected_backend == 'cuda':
+            trainer_kwargs.update({'accelerator': 'gpu', 'devices': 1})
+        elif selected_backend == 'cpu':
+            trainer_kwargs.update({'accelerator': 'cpu', 'devices': 1})
+        else:
+            trainer_kwargs.update({'accelerator': selected_backend, 'devices': 1})
+    else:
+        trainer_kwargs.update({'gpus': 1} if selected_backend == 'cuda' else {'gpus': None})
+
+    if selected_backend in ('cuda', 'xpu'):
+        pin_memory = True
+        if getattr(args, 'workers', 0) > 0:
+            persistent_workers = True
+
+    args.pin_memory = pin_memory
+    args.persistent_workers = persistent_workers
 
     print(
         "INFO: runtime="
         f"{runtime_device.type}, torch_threads={torch.get_num_threads()}, "
-        f"interop_threads={getattr(torch, 'get_num_interop_threads', lambda: 'n/a')()}"
+        f"interop_threads={getattr(torch, 'get_num_interop_threads', lambda: 'n/a')()}, "
+        f"lightning={pl.__version__}, ipex={'yes' if ipex is not None else 'no'}, "
+        f"torch_compile={'yes' if use_torch_compile else 'no'}"
     )
     if getattr(args, 'workers', None) is not None and args.workers > recommended_workers:
         print(
@@ -94,11 +167,15 @@ def configure_runtime(args):
 
     return {
         'device': runtime_device,
+        'selected_backend': selected_backend,
         'trainer_kwargs': trainer_kwargs,
         'recommended_threads': recommended_threads,
         'recommended_workers': recommended_workers,
         'xpu_available': xpu_available,
         'cuda_available': cuda_available,
+        'use_ipex': use_ipex,
+        'use_torch_compile': use_torch_compile,
+        'supports_accelerator_kw': supports_accelerator_kw,
     }
 
 
@@ -542,6 +619,13 @@ def parse_args():
     parser.add_argument('--whiten-prob', type=float, default=0.05)
     parser.add_argument('--pred-loss-weight', type=float, default=1.0)
     parser.add_argument('--warm-up', type=int, default=0)
+    parser.add_argument('--device-preference', type=str, default='auto',
+                        choices=['auto', 'cpu', 'cuda', 'xpu'])
+    parser.add_argument('--use-ipex', type=str_to_bool, nargs='?', const=True, default=True)
+    parser.add_argument('--torch-compile', type=str_to_bool, nargs='?', const=True, default=False)
+    parser.add_argument('--torch-compile-mode', type=str, default='reduce-overhead')
+    parser.add_argument('--matmul-precision', type=str, default='highest',
+                        choices=['highest', 'high', 'medium'])
     # graph params
     parser.add_argument("--adj-threshold", type=float, default=0.1)
 
@@ -675,6 +759,12 @@ def run_experiment(args):
                                              target_cls=filler_cls,
                                              return_dict=True)
     filler = filler_cls(**filler_kwargs)
+    if runtime['use_torch_compile']:
+        try:
+            filler.model = torch.compile(filler.model, mode=args.torch_compile_mode)
+            print(f"INFO: torch.compile activado con mode={args.torch_compile_mode}.")
+        except Exception as exc:
+            print(f"INFO: torch.compile no se pudo activar: {exc!r}")
 
     ########################################
     # training                             #
@@ -702,11 +792,16 @@ def run_experiment(args):
     # testing                              #
     ########################################
 
-    filler.load_state_dict(torch.load(checkpoint_callback.best_model_path,
-                                      lambda storage, loc: storage)['state_dict'])
+    filler.load_state_dict(
+        torch.load(
+            checkpoint_callback.best_model_path,
+            map_location=torch.device('cpu'),
+            weights_only=False,           # ← clave para PyTorch 2.6+
+        )['state_dict']
+    )
     filler.freeze()
     #print("DEBUG: Iniciando testing (trainer.test)...")
-    trainer.test()
+    #trainer.test(ckpt_path='best', weights_only=SECURE_LOAD)
     #print("DEBUG: trainer.test completado")
     filler.eval()
 

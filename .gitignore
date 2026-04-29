@@ -24,6 +24,7 @@ resultados_manglaria_v2/
 resultados_mexflux/
 resultados_patrones/
 tmp_viz/
+resultados_mexflux_exp
 
 # ─────────────────────────────
 # Logs
@@ -37,3 +38,13 @@ salida_completa.txt
 # ─────────────────────────────
 __pycache__/
 *.pyc
+
+# Datos adicionales
+datasets/
+*.csv
+
+# Logs específicos
+*.txt
+
+# Resultados generales (por si agregas nuevos)
+resultados_*/

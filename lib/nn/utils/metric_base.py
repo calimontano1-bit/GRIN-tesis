@@ -1,7 +1,7 @@
 from functools import partial
 
 import torch
-from pytorch_lightning.metrics import Metric
+from torchmetrics import Metric
 from torchmetrics.utilities.checks import _check_same_shape
 
 
@@ -16,20 +16,14 @@ class MaskedMetric(Metric):
                  dist_sync_fn=None,
                  metric_kwargs=None,
                  at=None):
-        super(MaskedMetric, self).__init__(compute_on_step=compute_on_step,
-                                           dist_sync_on_step=dist_sync_on_step,
-                                           process_group=process_group,
-                                           dist_sync_fn=dist_sync_fn)
+        super().__init__()
 
         if metric_kwargs is None:
             metric_kwargs = dict()
         self.metric_fn = partial(metric_fn, **metric_kwargs)
         self.mask_nans = mask_nans
         self.mask_inf = mask_inf
-        if at is None:
-            self.at = slice(None)
-        else:
-            self.at = slice(at, at + 1)
+        self.at = slice(None) if at is None else slice(at, at + 1)
         self.add_state('value', dist_reduce_fx='sum', default=torch.tensor(0.).float())
         self.add_state('numel', dist_reduce_fx='sum', default=torch.tensor(0))
 

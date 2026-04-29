@@ -62,6 +62,8 @@ import argparse
 import numpy as np
 import pandas as pd
 import subprocess as sp
+import torch.serialization
+torch.serialization.add_safe_globals([np.ndarray, np._core.multiarray._reconstruct])
 from visualizar_imputaciones import plot_imputations_grid, args_visualizacion, debe_visualizar
 print("Importación exitosa")
 
@@ -107,7 +109,7 @@ def parse_args():
                         help='Ruta al archivo CSV de datos')
     parser.add_argument('--output-dir',    type=str, default='resultados_experimentos')
     parser.add_argument('--epochs',        type=int, default=12)
-    parser.add_argument('--workers',       type=int, default=8)
+    parser.add_argument('--workers',       type=int, default=4)
     parser.add_argument('--corte-inicio',  type=str, default=None,
                         help='Inicio del corte temporal fijo (YYYY-MM-DD)')
     parser.add_argument('--corte-fin',     type=str, default=None,
